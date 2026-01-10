@@ -2853,6 +2853,16 @@ void loop() {
   if (millis() - lastNtpSync > ntpSyncInterval) {
     syncNTP();
   }
+
+  // Переподключение WiFi
+  static unsigned long lastWifiCheck = 0;
+  if (millis() - lastWifiCheck > 30000) {
+    lastWifiCheck = millis();
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("WiFi потерян, переподключение...");
+      WiFi.reconnect();
+    }
+  }
   
   // Автовыключение по таймеру
   if (autoOffMinutes > 0 && currentBrightness > 0 && !sunriseActive && !alarmTriggered && !demoActive) {
