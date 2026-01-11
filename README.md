@@ -64,15 +64,6 @@ graph LR
     PSU_GND --> GND
 ```
 
-| NodeMCU | Компонент |
-|---------|-----------|
-| VIN | БП +5V |
-| D1 | DS3231 SCL |
-| D2 | DS3231 SDA |
-| D4 | Лента DIN |
-| 3.3V | DS3231 VCC |
-| GND | DS3231 GND, БП GND |
-
 ## Установка
 
 1. Arduino IDE + ESP8266 Board
