@@ -68,7 +68,7 @@ int smoothness = 5;
 int colorSmoothness = 5;
 
 // Автовыключение (0 = выкл, 5-120 минут)
-int autoOffMinutes = 30;
+int autoOffMinutes = 5;
 unsigned long lastInteractionTime = 0;
 
 // Состояние
@@ -1182,8 +1182,8 @@ const char HTML_PAGE[] PROGMEM = R"rawliteral(
       <div class="section-title">Автовыключение при бездействии</div>
       <div class="section-content">
         <div class="slider-wrapper">
-          <div class="slider-tooltip" id="autoOffTooltip">30 мин</div>
-          <input type="range" class="slider" id="autoOff" min="0" max="120" step="5" value="30" 
+          <div class="slider-tooltip" id="autoOffTooltip">5 мин</div>
+          <input type="range" class="slider" id="autoOff" min="0" max="120" step="5" value="5" 
             oninput="updateAutoOff(this.value)"
             ontouchstart="showTooltip('autoOffTooltip', this)"
             ontouchmove="moveTooltip('autoOffTooltip', this)"
@@ -1197,7 +1197,7 @@ const char HTML_PAGE[] PROGMEM = R"rawliteral(
           <span>Выкл</span>
           <span>2 часа</span>
         </div>
-        <div class="slider-value-center" id="autoOffValue">30 мин</div>
+        <div class="slider-value-center" id="autoOffValue">5 мин</div>
       </div>
     </div>
 
@@ -1288,7 +1288,7 @@ const char HTML_PAGE[] PROGMEM = R"rawliteral(
     let customColor = '#ff5500';
     let smoothness = 5;
     let colorSmoothness = 5;
-    let autoOffMinutes = 30;
+    let autoOffMinutes = 5;
     let weekdaysBits = 0b00011111;
     let afterAlarmValue = '30';
     let demoRunning = false;
@@ -2038,6 +2038,22 @@ const char HTML_PAGE[] PROGMEM = R"rawliteral(
             p.classList.toggle('selected', p.dataset.preset === e.lp);
           });
         }
+
+        // Автовыключение
+        if (e.aoff !== undefined && e.aoff !== autoOffMinutes) {
+          autoOffMinutes = e.aoff;
+          const slider = document.getElementById('autoOff');
+          if (slider) slider.value = autoOffMinutes;
+          let t;
+          if (autoOffMinutes === 0) t = 'Выкл';
+          else if (autoOffMinutes < 60) t = autoOffMinutes + ' мин';
+          else {
+            const h = Math.floor(autoOffMinutes / 60), m = autoOffMinutes % 60;
+            t = m > 0 ? h + ' ч ' + m + ' мин' : h + (h == 1 ? ' час' : ' часа');
+          }
+          const label = document.getElementById('autoOffValue');
+          if (label) label.textContent = t;
+        }
       });
     }, 5000);
   </script>
@@ -2550,7 +2566,7 @@ void resetToDefaults() {
   // Настройки
   smoothness = 5;
   colorSmoothness = 5;
-  autoOffMinutes = 30;
+  autoOffMinutes = 5;
   
   // Сохраняем
   saveToEEPROM();
@@ -2886,7 +2902,7 @@ void loop() {
   // Переподключение WiFi
   static unsigned long lastWifiCheck = 0;
   static int wifiRetries = 0;
-  if (millis() - lastWifiCheck > 10000) {
+  if (millis() - lastWifiCheck > 5000) {
     lastWifiCheck = millis();
     if (WiFi.status() != WL_CONNECTED) {
       wifiRetries++;
@@ -2894,13 +2910,34 @@ void loop() {
 
       if (wifiRetries <= 3) {
         WiFi.reconnect();
-      } else {
+        // Ждем подключения до 10 сек
+        unsigned long start = millis();
+        while (WiFi.status() != WL_CONNECTED && millis() - start < 10000) {
+          delay(100);
+        }
+        if (WiFi.status() == WL_CONNECTED) {
+          Serial.println("WiFi переподключен");
+          wifiRetries = 0;
+        }
+      } else if (wifiRetries <= 6) {
         // Полный перезапуск WiFi
         Serial.println("Полный перезапуск WiFi...");
         WiFi.disconnect();
         delay(1000);
         WiFi.begin(ssid, password);
-        wifiRetries = 0;
+        unsigned long start = millis();
+        while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {
+          delay(100);
+        }
+        if (WiFi.status() == WL_CONNECTED) {
+          Serial.println("WiFi перезапущен");
+          wifiRetries = 0;
+        }
+      } else {
+        // Полная перезагрузка ESP
+        Serial.println("Перезагрузка ESP...");
+        delay(1000);
+        ESP.restart();
       }
     } else {
       wifiRetries = 0;
