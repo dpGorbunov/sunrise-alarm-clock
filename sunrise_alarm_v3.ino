@@ -2003,12 +2003,41 @@ const char HTML_PAGE[] PROGMEM = R"rawliteral(
     // Периодический опрос статуса (каждые 5 сек)
     setInterval(() => {
       fetch('/status').then(r => r.json()).then(e => {
+        // Время будильника
         alarmHours = e.h;
         alarmMinutes = e.m;
+        document.getElementById('alarmTime').textContent =
+          String(e.h).padStart(2,'0') + ':' + String(e.m).padStart(2,'0');
+
+        // Экран рассвета
         if (!window.sunriseScreenBlocked) {
           document.getElementById('sunriseScreen').classList.toggle('active', e.sunrise);
         }
         if (e.sunrise) updateSunriseTime();
+
+        // Яркость
+        const slider = document.getElementById('brightness');
+        if (slider && Math.abs(slider.value - e.b) > 1) {
+          slider.value = e.b;
+          updateBrightnessLabel(e.b);
+        }
+
+        // Переключатель будильника
+        const toggle = document.getElementById('alarmToggle');
+        if (toggle) toggle.classList.toggle('active', e.en);
+
+        // Дни недели
+        document.querySelectorAll('.weekday').forEach((el, i) => {
+          el.classList.toggle('active', (e.wd & (1 << i)) !== 0);
+        });
+
+        // Пресет света
+        if (e.lp && e.lp !== lightPreset) {
+          lightPreset = e.lp;
+          document.querySelectorAll('.color-preset').forEach(p => {
+            p.classList.toggle('selected', p.dataset.preset === e.lp);
+          });
+        }
       });
     }, 5000);
   </script>
@@ -2856,11 +2885,25 @@ void loop() {
 
   // Переподключение WiFi
   static unsigned long lastWifiCheck = 0;
-  if (millis() - lastWifiCheck > 30000) {
+  static int wifiRetries = 0;
+  if (millis() - lastWifiCheck > 10000) {
     lastWifiCheck = millis();
     if (WiFi.status() != WL_CONNECTED) {
-      Serial.println("WiFi потерян, переподключение...");
-      WiFi.reconnect();
+      wifiRetries++;
+      Serial.println("WiFi потерян, попытка " + String(wifiRetries));
+
+      if (wifiRetries <= 3) {
+        WiFi.reconnect();
+      } else {
+        // Полный перезапуск WiFi
+        Serial.println("Полный перезапуск WiFi...");
+        WiFi.disconnect();
+        delay(1000);
+        WiFi.begin(ssid, password);
+        wifiRetries = 0;
+      }
+    } else {
+      wifiRetries = 0;
     }
   }
   
