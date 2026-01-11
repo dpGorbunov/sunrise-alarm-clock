@@ -18,30 +18,60 @@
 ## Железо
 
 - ESP8266 (NodeMCU/Wemos D1)
-- WS2812B адресная лента (180 шт)
+- WS2812B адресная лента (176 шт)
 - DS3231 RTC модуль
 
 ### Подключение
 
-```
-BREADBOARD
-         a   b   c   d   e
-       ┌─────────────────────┐
-    2  │ ●   ●   ○   ○   ○   │  D1 + SCL
-    3  │ ●   ●   ○   ○   ○   │  D2 + SDA
-    5  │ ●   ●   ○   ○   ○   │  D4 + DIN ленты
-    6  │ ●   ●   ○   ○   ○   │  3V + VCC
-   14  │ ●   ●   ●   ○   ○   │  G + GND ленты + GND DS3231
-       └─────────────────────┘
+```mermaid
+graph LR
+    subgraph БП 5V
+        PSU_5V[+5V]
+        PSU_GND[GND]
+    end
 
-    b2 = провод мама-папа → DS3231 SCL
-    b3 = провод мама-папа → DS3231 SDA
-    b5 = DIN ленты (зелёный)
-    b6 = провод мама-папа → DS3231 VCC
-    c14 = провод мама-папа → DS3231 GND
+    subgraph NodeMCU
+        VIN
+        D1[D1/SCL]
+        D2[D2/SDA]
+        D4[D4]
+        V3[3.3V]
+        GND[GND]
+    end
+
+    subgraph DS3231
+        SCL
+        SDA
+        VCC
+        RTC_GND[GND]
+    end
+
+    subgraph WS2812B лента
+        DIN
+        LED_5V[5V]
+        LED_GND[GND]
+    end
+
+    D1 --> SCL
+    D2 --> SDA
+    V3 --> VCC
+    GND --> RTC_GND
+
+    D4 --> DIN
+    PSU_5V --> LED_5V
+    PSU_5V --> VIN
+    PSU_GND --> LED_GND
+    PSU_GND --> GND
 ```
 
-Лента питается от внешнего БП 5V (GND общий с ESP).
+| NodeMCU | Компонент |
+|---------|-----------|
+| VIN | БП +5V |
+| D1 | DS3231 SCL |
+| D2 | DS3231 SDA |
+| D4 | Лента DIN |
+| 3.3V | DS3231 VCC |
+| GND | DS3231 GND, БП GND |
 
 ## Установка
 
