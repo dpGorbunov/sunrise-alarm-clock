@@ -68,7 +68,7 @@ graph LR
 
 1. Arduino IDE + ESP8266 Board
 2. Библиотеки: `Adafruit NeoPixel`, `RTClib`
-3. Изменить WiFi в коде:
+3. Скопировать `secrets.h.example` в `secrets.h` и вписать свой WiFi (`secrets.h` в `.gitignore`):
    ```cpp
    const char* ssid = "YOUR_WIFI";
    const char* password = "YOUR_PASSWORD";

@@ -27,8 +27,7 @@ const unsigned long ntpSyncInterval = 3600000; // Синхронизация к�
 #include <EEPROM.h>
 
 // ===== НАСТРОЙКИ WiFi =====
-const char* ssid = "YOUR_WIFI";
-const char* password = "YOUR_PASSWORD";
+#include "secrets.h" // ssid и password, см. secrets.h.example
 
 // ===== НАСТРОЙКИ ЖЕЛЕЗА =====
 #define LED_PIN D4
