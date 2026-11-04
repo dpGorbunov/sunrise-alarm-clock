@@ -1,89 +1,106 @@
 /*
-  Рассвет-будильник v2
-  - Веб-интерфейс с выбором цвета свечения и градиента рассвета
-  - DS3231 RTC для хранения времени
-  - WS2812B адресная лента
-  - Дни недели
+  Рассвет-будильник v3
+  - ESP8266 (NodeMCU) + WS2812B + DS3231
+  - Источник времени: NTP (системное время ESP), DS3231 - резерв и память между перезагрузками
+  - Работает без WiFi: будильник идёт по RTC, сеть и веб поднимаются когда появятся
+  - Веб-интерфейс (PWA) на http://sunrise.local
 */
 
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
 #include <ESP8266mDNS.h>
-#include <time.h>
-
-// Forward declarations
-void resetToDefaults();
-void saveToEEPROM();
-
-// NTP настройки
-const char* ntpServer = "pool.ntp.org";
-const long gmtOffset = 3 * 3600; // GMT+3 (Москва)
-bool ntpSynced = false;
-unsigned long lastNtpSync = 0;
-const unsigned long ntpSyncInterval = 3600000; // Синхронизация каждый час
+#include <ArduinoOTA.h>
 #include <Wire.h>
 #include <RTClib.h>
 #include <Adafruit_NeoPixel.h>
 #include <EEPROM.h>
+#include <time.h>
+#include <sys/time.h>
+#include <coredecls.h> // settimeofday_cb
 
 // ===== НАСТРОЙКИ WiFi =====
-#include "secrets.h" // ssid и password, см. secrets.h.example
+#include "secrets.h" // ssid, password и otaPassword, см. secrets.h.example
 
 // ===== НАСТРОЙКИ ЖЕЛЕЗА =====
 #define LED_PIN D4
-#define LED_COUNT 180
+#define LED_COUNT 176
+#define POWER_LIMIT 200 // Потолок яркости ленты 200/255 (~78%) - защита БП, раньше делалось strip.setBrightness(200)
+
+// ===== ВРЕМЯ =====
+const long tzOffset = 3 * 3600; // MSK, GMT+3, без перехода на летнее время
+const char* ntpServer1 = "pool.ntp.org";
+const char* ntpServer2 = "time.google.com";
+const char* ntpServer3 = "time.cloudflare.com";
+const time_t MIN_VALID_EPOCH = 1700000000; // 2023-11-14; всё что раньше - время не установлено
+bool ntpSynced = false;
+bool rtcFound = false;
+volatile bool rtcWritePending = false; // NTP пришёл - записать время в DS3231 (делаем в loop, не в колбэке)
 
 // ===== ОБЪЕКТЫ =====
 ESP8266WebServer server(80);
 RTC_DS3231 rtc;
 Adafruit_NeoPixel strip(LED_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800);
+WiFiEventHandler wifiGotIpHandler, wifiDisconnectedHandler;
+volatile bool wifiJustConnected = false;
+bool mdnsStarted = false;
+bool otaStarted = false;
 
-// ===== ПЕРЕМЕННЫЕ =====
+// ===== НАСТРОЙКИ (хранятся в EEPROM) =====
 // Будильник
 int alarmHour = 7;
 int alarmMinute = 30;
 bool alarmEnabled = true;
-uint8_t weekdays = 0b00011111; // пн-пт включены (биты 0-6 = пн-вс)
+uint8_t weekdays = 0b00011111; // биты 0-6 = пн-вс, пн-пт включены
 
 // Рассвет
-int sunriseDuration = 20;
+int sunriseDuration = 20;         // минут
 String sunrisePreset = "classic"; // classic, warm, soft, custom
-uint32_t sunriseColors[3] = {0x990000, 0xFF4400, 0xFFE4C4}; // кастомный градиент
-
-// Свечение
-int brightness = 0;
-int currentBrightness = 0; // Текущая яркость для плавного перехода
-int targetBrightness = 0;  // Целевая яркость
-String lightPreset = "red"; // red, orange, yellow, white, rainbow, custom
-uint32_t customColor = 0xFF8844;
-uint32_t currentColor = 0xFF0000; // Текущий цвет для плавного перехода
-uint32_t targetColor = 0xFF0000;  // Целевой цвет
+uint32_t sunriseColors[3] = {0x990000, 0xFF4400, 0xFFE4C4}; // свой градиент
 
 // После будильника
 String afterAlarm = "30"; // keep, 30, 60
 
-// Плавность (0-10, где 0 = самый плавный, 10 = резкий)
-int smoothness = 5;
-int colorSmoothness = 5;
+// Свечение
+String lightPreset = "red"; // red, orange, yellow, white, rainbow, custom
+uint32_t customColor = 0xFF8844;
+int smoothness = 5;       // 0-10, шаг плавности ручного света
+int autoOffMinutes = 5;   // 0 = выкл, иначе 5-120 минут
 
-// Автовыключение (0 = выкл, 5-120 минут)
-int autoOffMinutes = 5;
+// Какой запуск будильника (дата + время) пользователь уже выключил. Переживает перезагрузку.
+int32_t dismissedKey = -1;
+
+// ===== РУЧНОЙ СВЕТ =====
+int brightness = 0;             // целевая яркость 0-100 (её видит UI)
+float currentBrightness = 0;    // текущая, плавно догоняет brightness
 unsigned long lastInteractionTime = 0;
 
-// Состояние
-bool sunriseActive = false;
-unsigned long alarmTriggeredTime = 0;
-bool alarmTriggered = false;
-int alarmDismissedAt = -1; // Минута когда будильник был выключен (-1 = не выключен)
+// ===== СОСТОЯНИЕ БУДИЛЬНИКА =====
+// Окно запуска будильника, в которое попадает текущее время (объявлено здесь, чтобы Arduino
+// мог сгенерировать прототипы функций, которые его возвращают)
+struct AlarmWindow {
+  bool active;    // текущее время попадает в окно какого-то запуска
+  bool inSunrise; // true = идёт рассвет, false = время будильника уже наступило (окно удержания 5 мин)
+  float progress; // 0..1
+  int32_t key;
+};
+
+enum Phase { PHASE_IDLE, PHASE_SUNRISE, PHASE_HOLD };
+Phase phase = PHASE_IDLE;
+int32_t activeKey = -1;            // ключ запуска, который сейчас идёт
+float sunriseProgress = 0;         // 0..1, обновляется раз в секунду из часов
+unsigned long holdStartMillis = 0; // начало PHASE_HOLD, от него считается afterAlarm
+long snoozeUntil = 0;              // локальное время (сек от 1970), когда отложенный будильник включится; 0 = нет
+
+// Демо рассвета - со своими цветами, настройки будильника не трогает
 bool demoActive = false;
 unsigned long demoStartTime = 0;
 int demoSpeed = 30;
+String demoPreset = "classic";
+uint32_t demoColors[3] = {0x990000, 0xFF4400, 0xFFE4C4};
 
-// Плавный рассвет - exponential blend
-unsigned long sunriseStartMillis = 0;
-unsigned long sunriseDurationMillis = 0;
-float curR = 0, curG = 0, curB = 0, curBr = 0; // Текущие значения (float для плавности)
-float tgtR = 0, tgtG = 0, tgtB = 0, tgtBr = 0; // Целевые значения
+// Текущий кадр рассвета/демо (float для плавности)
+float curR = 0, curG = 0, curB = 0, curBr = 0; // текущие значения
+float tgtR = 0, tgtG = 0, tgtB = 0, tgtBr = 0; // целевые значения
 
 // ===== EEPROM =====
 #define EEPROM_SIZE 64
@@ -92,19 +109,34 @@ float tgtR = 0, tgtG = 0, tgtB = 0, tgtBr = 0; // Целевые значени�
 #define ADDR_ENABLED 2
 #define ADDR_WEEKDAYS 3
 #define ADDR_DURATION 4
-#define ADDR_BRIGHTNESS 5
-#define ADDR_SUNRISE_PRESET 6 // 1 byte: 0=classic, 1=warm, 2=soft, 3=custom
-#define ADDR_LIGHT_PRESET 7   // 1 byte: 0=red, 1=orange, 2=yellow, 3=white, 4=rainbow, 5=custom
-#define ADDR_CUSTOM_COLOR 8   // 3 bytes RGB
-#define ADDR_SUNRISE_C1 11    // 3 bytes
-#define ADDR_SUNRISE_C2 14    // 3 bytes
-#define ADDR_SUNRISE_C3 17    // 3 bytes
-#define ADDR_AFTER_ALARM 20   // 1 byte: 0=keep, 1=30, 2=60
-#define ADDR_SMOOTHNESS 21    // 1 byte: 0-10
-#define ADDR_COLOR_SMOOTHNESS 22 // 1 byte: 0-10
-#define ADDR_AUTO_OFF 23      // 1 byte: 0=off, or minutes (5-120)
-#define ADDR_MAGIC 24         // 1 byte: magic number для проверки инициализации
-#define MAGIC_VALUE 0xAB      // Магическое число
+#define ADDR_BRIGHTNESS 5        // не используется, оставлен ради раскладки
+#define ADDR_SUNRISE_PRESET 6    // 1 byte: 0=classic, 1=warm, 2=soft, 3=custom
+#define ADDR_LIGHT_PRESET 7      // 1 byte: 0=red, 1=orange, 2=yellow, 3=white, 4=rainbow, 5=custom
+#define ADDR_CUSTOM_COLOR 8      // 3 bytes RGB
+#define ADDR_SUNRISE_C1 11       // 3 bytes
+#define ADDR_SUNRISE_C2 14       // 3 bytes
+#define ADDR_SUNRISE_C3 17       // 3 bytes
+#define ADDR_AFTER_ALARM 20      // 1 byte: 0=keep, 1=30, 2=60
+#define ADDR_SMOOTHNESS 21       // 1 byte: 0-10
+#define ADDR_COLOR_SMOOTHNESS 22 // не используется
+#define ADDR_AUTO_OFF 23         // 1 byte: 0=off, или минуты (5-120)
+#define ADDR_MAGIC 24            // 1 byte: magic number для проверки инициализации
+#define ADDR_DISMISSED_KEY 25    // 4 bytes int32
+#define MAGIC_VALUE 0xAB
+
+// Настройки пишем во флеш не на каждое движение слайдера, а через 3 с после последнего изменения
+bool settingsDirty = false;
+unsigned long settingsDirtySince = 0;
+const unsigned long EEPROM_COMMIT_DELAY = 3000;
+
+// ===== ЖУРНАЛ =====
+// Последние строки лога хранятся в памяти и отдаются по http://sunrise.local/log.
+// Живут до перезагрузки. 40 строк по 160 байт (кириллица в UTF-8 по 2 байта) = 6.4 КБ.
+#define LOG_LINES 40
+#define LOG_LINE_LEN 160
+char logBuf[LOG_LINES][LOG_LINE_LEN];
+uint8_t logHead = 0;  // куда писать следующую строку
+uint8_t logCount = 0; // сколько строк заполнено
 
 // ===== HTML =====
 const char HTML_PAGE[] PROGMEM = R"rawliteral(
@@ -985,6 +1017,13 @@ const char HTML_PAGE[] PROGMEM = R"rawliteral(
       padding: 0 4px;
       user-select: none;
     }
+    .snooze-info {
+      min-height: 18px;
+      margin-top: 4px;
+      font-size: 14px;
+      color: #ffb366;
+      text-align: center;
+    }
   </style>
 </head>
 <body>
@@ -997,6 +1036,7 @@ const char HTML_PAGE[] PROGMEM = R"rawliteral(
       <div class="section-label">Будильник-рассвет</div>
       <div class="alarm-icon">☀️</div>
       <div class="time-display" id="timeDisplay" onclick="openTimeModal()">07:30</div>
+      <div class="snooze-info" id="snoozeInfo"></div>
       <div class="toggle-wrapper">
         <div class="toggle active" id="alarmToggle" onclick="toggleAlarm()"></div>
       </div>
@@ -1161,6 +1201,7 @@ const char HTML_PAGE[] PROGMEM = R"rawliteral(
           <div class="slider-tooltip" id="smoothnessTooltip">5</div>
           <input type="range" class="slider" id="smoothness" min="0" max="10" value="5" 
             oninput="updateSmoothness(this.value)"
+               onchange="sendData()"
             ontouchstart="showTooltip('smoothnessTooltip', this)"
             ontouchmove="moveTooltip('smoothnessTooltip', this)"
             ontouchend="hideTooltip('smoothnessTooltip')"
@@ -1184,6 +1225,7 @@ const char HTML_PAGE[] PROGMEM = R"rawliteral(
           <div class="slider-tooltip" id="autoOffTooltip">5 мин</div>
           <input type="range" class="slider" id="autoOff" min="0" max="120" step="5" value="5" 
             oninput="updateAutoOff(this.value)"
+               onchange="sendData()"
             ontouchstart="showTooltip('autoOffTooltip', this)"
             ontouchmove="moveTooltip('autoOffTooltip', this)"
             ontouchend="hideTooltip('autoOffTooltip')"
@@ -1225,11 +1267,27 @@ const char HTML_PAGE[] PROGMEM = R"rawliteral(
       <div class="section-content">
         <div class="info-row">
           <span class="label">WiFi</span>
-          <span class="value">HomeNetwork ✓</span>
+          <span class="value" id="wifiName">—</span>
         </div>
         <div class="info-row">
           <span class="label">IP</span>
-          <span class="value">192.168.1.50</span>
+          <span class="value" id="ipAddr">—</span>
+        </div>
+        <div class="info-row">
+          <span class="label">Время устройства</span>
+          <span class="value" id="devTime">—</span>
+        </div>
+        <div class="info-row">
+          <span class="label">Источник времени</span>
+          <span class="value" id="timeSrc">—</span>
+        </div>
+        <div class="info-row">
+          <span class="label">Часы DS3231</span>
+          <span class="value" id="rtcStatus">—</span>
+        </div>
+        <div class="info-row">
+          <span class="label">Журнал</span>
+          <span class="value"><a href="/log" target="_blank" style="color:#ffb366">открыть</a></span>
         </div>
         <div class="info-row">
           <span class="label">Адрес</span>
@@ -1286,7 +1344,6 @@ const char HTML_PAGE[] PROGMEM = R"rawliteral(
     let selectedSunrisePreset = 'classic';
     let customColor = '#ff5500';
     let smoothness = 5;
-    let colorSmoothness = 5;
     let autoOffMinutes = 5;
     let weekdaysBits = 0b00011111;
     let afterAlarmValue = '30';
@@ -1563,18 +1620,9 @@ const char HTML_PAGE[] PROGMEM = R"rawliteral(
     }
     
     function applyCustomColor(color) {
-      customColor = color;
       selectedPreset = 'custom';
-      
-      // Снимаем выделение с пресетов
-      document.querySelectorAll('.color-preset').forEach(p => p.classList.remove('selected'));
-      
-      // Выделяем кнопку своего цвета и меняем её фон
-      const customBtn = document.querySelector('.preset-custom');
-      customBtn.classList.add('selected');
-      customBtn.style.background = color;
-      customBtn.style.border = 'none';
-      customBtn.textContent = '';
+      showCustomColor(color);
+      markLightPreset('custom');
       sendLight();
     }
     
@@ -1622,15 +1670,6 @@ const char HTML_PAGE[] PROGMEM = R"rawliteral(
       sendLight();
     }
     
-    // Для совместимости со старым кодом
-    function updateBrightness(val) {
-      updateBrightnessLabel(val);
-    }
-    
-    function sendSettings() {
-      sendData();
-    }
-    
     function sendLight() {
       let url = '/light?p=' + selectedPreset + '&b=' + brightness;
       if (selectedPreset === 'custom') {
@@ -1644,7 +1683,7 @@ const char HTML_PAGE[] PROGMEM = R"rawliteral(
       const c1 = document.getElementById('color1').value;
       const c2 = document.getElementById('color2').value;
       const c3 = document.getElementById('color3').value;
-      fetch('/save?h=' + alarmHours + '&m=' + alarmMinutes + '&en=' + (alarmEnabled?1:0) + '&wd=' + weekdaysBits + '&dur=' + duration + '&sp=' + selectedSunrisePreset + '&c1=' + c1.slice(1) + '&c2=' + c2.slice(1) + '&c3=' + c3.slice(1) + '&aa=' + afterAlarmValue + '&smooth=' + smoothness + '&csmooth=' + colorSmoothness + '&aoff=' + autoOffMinutes);
+      fetch('/save?h=' + alarmHours + '&m=' + alarmMinutes + '&en=' + (alarmEnabled?1:0) + '&wd=' + weekdaysBits + '&dur=' + duration + '&sp=' + selectedSunrisePreset + '&c1=' + c1.slice(1) + '&c2=' + c2.slice(1) + '&c3=' + c3.slice(1) + '&aa=' + afterAlarmValue + '&smooth=' + smoothness + '&aoff=' + autoOffMinutes);
     }
     
     function resetSettings() {
@@ -1688,8 +1727,6 @@ const char HTML_PAGE[] PROGMEM = R"rawliteral(
           tooltip.textContent = s > 0 ? min + ' мин ' + s + ' сек' : min + ' мин';
         }
       } else if (tooltipId === 'smoothnessTooltip') {
-        tooltip.textContent = slider.value;
-      } else if (tooltipId === 'colorSmoothnessTooltip') {
         tooltip.textContent = slider.value;
       } else if (tooltipId === 'autoOffTooltip') {
         const v = parseInt(slider.value);
@@ -1760,31 +1797,50 @@ const char HTML_PAGE[] PROGMEM = R"rawliteral(
     function updateSmoothness(val) {
       smoothness = parseInt(val);
       document.getElementById('smoothnessValue').textContent = smoothness;
-      sendData();
-    }
-    
-    // Плавность цвета
-    function updateColorSmoothness(val) {
-      colorSmoothness = parseInt(val);
-      document.getElementById('colorSmoothnessValue').textContent = colorSmoothness;
-      sendData();
     }
     
     // Автовыключение
     function updateAutoOff(val) {
       autoOffMinutes = parseInt(val);
-      let text;
-      if (autoOffMinutes === 0) {
-        text = 'Выкл';
-      } else if (autoOffMinutes < 60) {
-        text = autoOffMinutes + ' мин';
-      } else {
-        const h = Math.floor(autoOffMinutes / 60);
-        const m = autoOffMinutes % 60;
-        text = m > 0 ? h + ' ч ' + m + ' мин' : h + (h == 1 ? ' час' : ' часа');
-      }
-      document.getElementById('autoOffValue').textContent = text;
-      sendData();
+      document.getElementById('autoOffValue').textContent = autoOffText(autoOffMinutes);
+    }
+
+    function autoOffText(v) {
+      if (v === 0) return 'Выкл';
+      if (v < 60) return v + ' мин';
+      const h = Math.floor(v / 60), m = v % 60;
+      return m > 0 ? h + ' ч ' + m + ' мин' : h + (h == 1 ? ' час' : ' часа');
+    }
+
+    function pad(n) {
+      return String(n).padStart(2, '0');
+    }
+
+    // Подсветить выбранный пресет свечения
+    function markLightPreset(name) {
+      document.querySelectorAll('.color-preset').forEach(el => el.classList.remove('selected'));
+      const el = document.querySelector('.preset-' + name);
+      if (el) el.classList.add('selected');
+    }
+
+    // Показать свой цвет на кнопке "✎"
+    function showCustomColor(color) {
+      customColor = color;
+      const btn = document.querySelector('.preset-custom');
+      btn.style.background = color;
+      btn.style.border = 'none';
+      btn.textContent = '';
+    }
+
+    // Раздел "Информация"
+    function updateInfo(e) {
+      document.getElementById('wifiName').textContent = e.wifi ? e.wifi + ' ✓ (' + e.rssi + ' dBm)' : 'Нет соединения';
+      document.getElementById('ipAddr').textContent = e.ip || '—';
+      document.getElementById('devTime').textContent = e.time || '—';
+      const src = {ntp: 'NTP ✓', rtc: 'Часы DS3231 (NTP нет)', none: 'НЕТ ВРЕМЕНИ - будильник не сработает'};
+      document.getElementById('timeSrc').textContent = src[e.tsrc] || e.tsrc;
+      document.getElementById('rtcStatus').textContent = e.rtc ? 'Подключены ✓' : 'Не найдены - проверь D1/D2';
+      document.getElementById('snoozeInfo').textContent = e.snz ? 'Отложено до ' + e.snz : '';
     }
     
     // Скорость демо
@@ -1954,106 +2010,71 @@ const char HTML_PAGE[] PROGMEM = R"rawliteral(
           el.classList.toggle('selected', el.dataset.preset === selectedSunrisePreset);
         });
         
-        document.querySelectorAll('.color-preset').forEach(el => el.classList.remove('selected'));
-        const presetEl = document.querySelector('.preset-' + selectedPreset);
-        if (presetEl) presetEl.classList.add('selected');
-        
+        markLightPreset(selectedPreset);
+        if (e.c) showCustomColor('#' + e.c.toLowerCase());
+
         if (e.c1) {
           document.getElementById('color1').value = '#' + e.c1;
           document.getElementById('color2').value = '#' + e.c2;
           document.getElementById('color3').value = '#' + e.c3;
           updateCustomGradient();
         }
-        
-        if (e.wifi) document.getElementById('wifiName').textContent = e.wifi + ' ✓';
-        if (e.ip) document.getElementById('ipAddr').textContent = e.ip;
-        document.getElementById('ntpStatus').textContent = e.ntp ? 'Синхронизировано ✓' : 'Не синхронизировано';
-        
-        if (e.smooth !== undefined) {
-          smoothness = e.smooth;
-          document.getElementById('smoothness').value = smoothness;
-          document.getElementById('smoothnessValue').textContent = smoothness;
-        }
-        
-        if (e.csmooth !== undefined) {
-          colorSmoothness = e.csmooth;
-          document.getElementById('colorSmoothness').value = colorSmoothness;
-          document.getElementById('colorSmoothnessValue').textContent = colorSmoothness;
-        }
-        
-        if (e.aoff !== undefined) {
-          autoOffMinutes = e.aoff;
-          document.getElementById('autoOff').value = autoOffMinutes;
-          let t;
-          if (autoOffMinutes === 0) t = 'Выкл';
-          else if (autoOffMinutes < 60) t = autoOffMinutes + ' мин';
-          else {
-            const h = Math.floor(autoOffMinutes / 60), m = autoOffMinutes % 60;
-            t = m > 0 ? h + ' ч ' + m + ' мин' : h + (h == 1 ? ' час' : ' часа');
-          }
-          document.getElementById('autoOffValue').textContent = t;
-        }
-        
+
+        smoothness = e.smooth;
+        document.getElementById('smoothness').value = smoothness;
+        document.getElementById('smoothnessValue').textContent = smoothness;
+
+        autoOffMinutes = e.aoff;
+        document.getElementById('autoOff').value = autoOffMinutes;
+        document.getElementById('autoOffValue').textContent = autoOffText(autoOffMinutes);
+
+        updateInfo(e);
         document.getElementById('sunriseScreen').classList.toggle('active', e.sunrise);
         updateSunriseTime();
-      });
+      }).catch(err => console.error('status:', err));
     }
     
-    // Периодический опрос статуса (каждые 5 сек)
+    // Периодический опрос статуса (каждые 5 сек): состояние будильника и всё, что могло
+    // измениться с другого устройства
     setInterval(() => {
       fetch('/status').then(r => r.json()).then(e => {
-        // Время будильника
         alarmHours = e.h;
         alarmMinutes = e.m;
-        document.getElementById('alarmTime').textContent =
-          String(e.h).padStart(2,'0') + ':' + String(e.m).padStart(2,'0');
+        document.getElementById('timeDisplay').textContent = pad(e.h) + ':' + pad(e.m);
 
-        // Экран рассвета
         if (!window.sunriseScreenBlocked) {
           document.getElementById('sunriseScreen').classList.toggle('active', e.sunrise);
         }
         if (e.sunrise) updateSunriseTime();
 
-        // Яркость
         const slider = document.getElementById('brightness');
-        if (slider && Math.abs(slider.value - e.b) > 1) {
+        if (Math.abs(slider.value - e.b) > 1) {
           slider.value = e.b;
           updateBrightnessLabel(e.b);
         }
 
-        // Переключатель будильника
-        const toggle = document.getElementById('alarmToggle');
-        if (toggle) toggle.classList.toggle('active', e.en);
+        alarmEnabled = e.en;
+        document.getElementById('alarmToggle').classList.toggle('active', e.en);
 
-        // Дни недели
+        weekdaysBits = e.wd;
         document.querySelectorAll('.weekday').forEach((el, i) => {
           el.classList.toggle('active', (e.wd & (1 << i)) !== 0);
         });
 
-        // Пресет света
-        if (e.lp && e.lp !== lightPreset) {
-          lightPreset = e.lp;
-          document.querySelectorAll('.color-preset').forEach(p => {
-            p.classList.toggle('selected', p.dataset.preset === e.lp);
-          });
+        if (e.lp !== selectedPreset) {
+          selectedPreset = e.lp;
+          markLightPreset(e.lp);
+        }
+        if (e.c && '#' + e.c.toLowerCase() !== customColor) showCustomColor('#' + e.c.toLowerCase());
+
+        if (e.aoff !== autoOffMinutes) {
+          autoOffMinutes = e.aoff;
+          document.getElementById('autoOff').value = autoOffMinutes;
+          document.getElementById('autoOffValue').textContent = autoOffText(autoOffMinutes);
         }
 
-        // Автовыключение
-        if (e.aoff !== undefined && e.aoff !== autoOffMinutes) {
-          autoOffMinutes = e.aoff;
-          const slider = document.getElementById('autoOff');
-          if (slider) slider.value = autoOffMinutes;
-          let t;
-          if (autoOffMinutes === 0) t = 'Выкл';
-          else if (autoOffMinutes < 60) t = autoOffMinutes + ' мин';
-          else {
-            const h = Math.floor(autoOffMinutes / 60), m = autoOffMinutes % 60;
-            t = m > 0 ? h + ' ч ' + m + ' мин' : h + (h == 1 ? ' час' : ' часа');
-          }
-          const label = document.getElementById('autoOffValue');
-          if (label) label.textContent = t;
-        }
-      });
+        updateInfo(e);
+      }).catch(() => {});
     }, 5000);
   </script>
 </body>
@@ -2062,31 +2083,247 @@ const char HTML_PAGE[] PROGMEM = R"rawliteral(
 
 const char MANIFEST[] PROGMEM = R"({"name":"Рассвет","short_name":"Рассвет","start_url":"/","display":"standalone","background_color":"#1a1a2e","theme_color":"#1a1a2e","icons":[{"src":"data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>☀️</text></svg>","sizes":"any","type":"image/svg+xml"}]})";
 
-// ===== ФУНКЦИИ ЛЕНТЫ =====
+// ===== ВРЕМЯ =====
+// Вся логика будильника работает с "локальным эпохом": секунды от 1970 в местном времени (UTC + tzOffset).
+// Источник: системное время ESP (его держит NTP), если его нет - DS3231. RTC хранит локальное время, как и раньше.
 
-void showStrip() {
-  noInterrupts();
-  strip.show();
-  interrupts();
+bool rtcTimeValid() {
+  if (!rtcFound) return false;
+  DateTime t = rtc.now();
+  return t.isValid() && t.year() >= 2024 && t.year() <= 2099;
 }
 
-void setAllLeds(uint8_t r, uint8_t g, uint8_t b, int br) {
-  float mult = br / 100.0;
-  uint8_t rOut = (uint8_t)(r * mult);
-  uint8_t gOut = (uint8_t)(g * mult);
-  uint8_t bOut = (uint8_t)(b * mult);
-  for (int i = 0; i < LED_COUNT; i++) {
-    strip.setPixelColor(i, strip.Color(rOut, gOut, bOut));
+bool getLocalEpoch(long& localEpoch) {
+  time_t now = time(nullptr);
+  if (now > MIN_VALID_EPOCH) {
+    localEpoch = (long)now + tzOffset;
+    return true;
   }
-  showStrip();
+  if (rtcTimeValid()) {
+    localEpoch = (long)rtc.now().unixtime();
+    return true;
+  }
+  return false;
 }
 
-void turnOff() {
+const char* timeSource() {
+  if (time(nullptr) > MIN_VALID_EPOCH) return ntpSynced ? "ntp" : "rtc"; // системное время могло прийти из RTC при старте
+  if (rtcTimeValid()) return "rtc";
+  return "none";
+}
+
+void formatLocalTime(char* buf, size_t len) {
+  long le;
+  if (!getLocalEpoch(le)) { snprintf(buf, len, "--:--:--"); return; }
+  long s = le % 86400;
+  snprintf(buf, len, "%02ld:%02ld:%02ld", s / 3600, (s / 60) % 60, s % 60);
+}
+
+// Строка лога: в Serial и в кольцевой буфер для /log. Формат printf, время подставляется само
+void logMsg(const char* fmt, ...) {
+  char* line = logBuf[logHead];
+  formatLocalTime(line, 10);
+  line[8] = ' ';
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(line + 9, LOG_LINE_LEN - 9, fmt, ap);
+  va_end(ap);
+  Serial.println(line);
+  logHead = (logHead + 1) % LOG_LINES;
+  if (logCount < LOG_LINES) logCount++;
+}
+
+// Колбэк settimeofday: вызывается и когда время пришло от NTP, и когда мы сами ставим его из RTC
+void onTimeSet(bool fromSntp) {
+  if (!fromSntp) return;
+  ntpSynced = true;
+  rtcWritePending = true;
+}
+
+void setupTime() {
+  Wire.begin(D2, D1);
+  rtcFound = rtc.begin();
+  if (!rtcFound) {
+    logMsg("RTC: DS3231 не найден - проверь D1 (SCL), D2 (SDA), питание. Будильник будет работать только при наличии NTP");
+  } else if (rtc.lostPower()) {
+    logMsg("RTC: часы сбрасывались (батарейка?), время в них недостоверно до синхронизации NTP");
+  }
+
+  // SNTP стартует сразу и сам дождётся сети, ждать WiFi не нужно
+  configTime(tzOffset, 0, ntpServer1, ntpServer2, ntpServer3);
+  settimeofday_cb(onTimeSet);
+
+  // Пока NTP нет - берём время из RTC, чтобы будильник работал без сети
+  if (rtcTimeValid()) {
+    timeval tv = { (time_t)(rtc.now().unixtime() - tzOffset), 0 };
+    settimeofday(&tv, nullptr);
+    logMsg("RTC: время взято из DS3231");
+  }
+}
+
+// ===== WiFi =====
+// Ничего не ждём и не перезагружаем ESP: ядро переподключается само, будильник от сети не зависит
+
+void setupWiFi() {
+  WiFi.persistent(false);
+  WiFi.mode(WIFI_STA);
+  WiFi.hostname("sunrise");
+  WiFi.setAutoReconnect(true);
+
+  wifiGotIpHandler = WiFi.onStationModeGotIP([](const WiFiEventStationModeGotIP& e) {
+    wifiJustConnected = true;
+  });
+  wifiDisconnectedHandler = WiFi.onStationModeDisconnected([](const WiFiEventStationModeDisconnected& e) {
+    static unsigned long lastLog = 0;
+    if (millis() - lastLog > 30000) {
+      lastLog = millis();
+      logMsg("WiFi: нет соединения (причина %d), переподключение автоматическое", e.reason);
+    }
+  });
+
+  WiFi.begin(ssid, password);
+  logMsg("WiFi: подключаюсь к \"%s\" в фоне", ssid);
+}
+
+void handleWiFi() {
+  if (wifiJustConnected) {
+    wifiJustConnected = false;
+    logMsg("WiFi: подключено, IP %s", WiFi.localIP().toString().c_str());
+    if (!mdnsStarted) {
+      mdnsStarted = MDNS.begin("sunrise");
+      if (mdnsStarted) logMsg("mDNS: http://sunrise.local");
+    } else {
+      MDNS.notifyAPChange();
+    }
+    if (!otaStarted) {
+      setupOTA();
+      otaStarted = true;
+    }
+  }
+
+  // Страховка: если ядро 5 минут не может подключиться - начинаем заново
+  static unsigned long lastConnected = 0;
+  if (WiFi.status() == WL_CONNECTED) {
+    lastConnected = millis();
+  } else if (millis() - lastConnected > 300000UL) {
+    lastConnected = millis();
+    logMsg("WiFi: 5 минут без сети, перезапуск подключения");
+    WiFi.disconnect();
+    WiFi.begin(ssid, password);
+  }
+}
+
+// ===== OTA: прошивка по WiFi =====
+// arduino-cli upload -p <ip или sunrise.local> --fqbn esp8266:esp8266:nodemcuv2 ~/Arduino/sunrise_alarm_v3
+// Пароль - otaPassword из secrets.h. Во время прошивки лента гаснет, настройки в EEPROM сохраняются
+
+void setupOTA() {
+  ArduinoOTA.setHostname("sunrise");
+  ArduinoOTA.setPassword(otaPassword);
+  ArduinoOTA.onStart([]() {
+    demoActive = false;
+    phase = PHASE_IDLE;
+    renderOff();
+    if (settingsDirty) saveToEEPROM();
+    logMsg("OTA: приём прошивки");
+  });
+  ArduinoOTA.onEnd([]() { logMsg("OTA: готово, перезагрузка"); });
+  ArduinoOTA.onProgress([](unsigned int done, unsigned int total) {
+    static unsigned int lastPct = 100;
+    unsigned int pct = done * 100 / total;
+    if (pct / 10 != lastPct / 10) { lastPct = pct; Serial.printf("OTA: %u%%\n", pct); }
+  });
+  ArduinoOTA.onError([](ota_error_t e) { logMsg("OTA: ошибка %u", e); });
+  ArduinoOTA.begin();
+  logMsg("OTA: включено, хост sunrise");
+}
+
+// ===== ВЫВОД НА ЛЕНТУ =====
+// Вся лента одного цвета. Яркость считаем в 16 бит с гаммой 2.2, младший байт распределяем по ленте
+// (часть диодов на один уровень выше) - рассвет без ступеней 1-2-3 в первые минуты.
+// show() вызывается только когда кадр реально изменился: во время show() на 180 LED прерывания
+// выключены ~5.4 мс, и лишние вызовы мешают WiFi.
+
+uint16_t gamma16[256];
+uint8_t ditherRank[LED_COUNT]; // порядок, в котором диоды получают "+1": равномерно по ленте, узор не движется
+uint32_t lastR16 = 0xFFFFFFFF, lastG16 = 0xFFFFFFFF, lastB16 = 0xFFFFFFFF; // последний выведенный кадр
+bool stripIsOff = false;
+
+void buildGamma() {
+  for (int i = 0; i < 256; i++) {
+    gamma16[i] = (uint16_t)(pow(i / 255.0, 2.2) * 65535.0 + 0.5);
+  }
+  // Порядок дизеринга - перестановка индексов с обращением битов: соседние по рангу диоды
+  // максимально далеко друг от друга, при росте яркости новые добавляются между уже горящими
+  uint8_t rank = 0;
+  for (int v = 0; v < 256; v++) {
+    int idx = 0;
+    for (int b = 0; b < 8; b++) if (v & (1 << b)) idx |= 1 << (7 - b);
+    if (idx < LED_COUNT) ditherRank[idx] = rank++;
+  }
+}
+
+void renderOff() {
+  if (stripIsOff) return;
   strip.clear();
-  showStrip();
+  strip.show();
+  stripIsOff = true;
+  lastR16 = lastG16 = lastB16 = 0xFFFFFFFF;
 }
 
-// Интерполяция цвета
+// r,g,b 0-255 - цвет; level 0.0-1.0 - воспринимаемая яркость
+void renderColor(uint8_t r, uint8_t g, uint8_t b, float level) {
+  if (level <= 0.0f) { renderOff(); return; }
+  if (level > 1.0f) level = 1.0f;
+
+  float lin = pow(level, 2.2) * (POWER_LIMIT / 255.0);
+
+  // Пол: самый яркий канал не опускается ниже уровня 1 на всей ленте. Иначе в начале рассвета
+  // горели бы отдельные диоды на голой ленте - выглядит как бегающие точки, а не как рассвет
+  uint16_t maxG = max(gamma16[r], max(gamma16[g], gamma16[b]));
+  if (maxG > 0 && lin * maxG < 256.0f) lin = 256.0f / maxG;
+
+  uint32_t r16 = gamma16[r] * lin;
+  uint32_t g16 = gamma16[g] * lin;
+  uint32_t b16 = gamma16[b] * lin;
+  if (r16 == lastR16 && g16 == lastG16 && b16 == lastB16) return;
+  lastR16 = r16; lastG16 = g16; lastB16 = b16;
+  stripIsOff = false;
+
+  // Сколько диодов получают уровень +1 по каждому каналу (из младшего байта)
+  uint16_t kr = ((r16 & 0xFF) * LED_COUNT) >> 8;
+  uint16_t kg = ((g16 & 0xFF) * LED_COUNT) >> 8;
+  uint16_t kb = ((b16 & 0xFF) * LED_COUNT) >> 8;
+  uint8_t rb = r16 >> 8, gb = g16 >> 8, bb = b16 >> 8;
+
+  for (uint16_t i = 0; i < LED_COUNT; i++) {
+    uint8_t rank = ditherRank[i];
+    uint8_t ro = rb + (rb < 255 && rank < kr ? 1 : 0);
+    uint8_t go = gb + (gb < 255 && rank < kg ? 1 : 0);
+    uint8_t bo = bb + (bb < 255 && rank < kb ? 1 : 0);
+    strip.setPixelColor(i, ro, go, bo);
+  }
+  strip.show();
+}
+
+void renderRainbow(float level) {
+  static uint16_t j = 0;
+  j += 256;
+  float lin = pow(level, 2.2) * (POWER_LIMIT / 255.0);
+  for (uint16_t i = 0; i < LED_COUNT; i++) {
+    uint32_t c = strip.gamma32(strip.ColorHSV(((uint32_t)i * 65536 / LED_COUNT + j) & 0xFFFF));
+    uint8_t r = ((c >> 16) & 0xFF) * lin;
+    uint8_t g = ((c >> 8) & 0xFF) * lin;
+    uint8_t b = (c & 0xFF) * lin;
+    strip.setPixelColor(i, r, g, b);
+  }
+  strip.show();
+  stripIsOff = false;
+  lastR16 = lastG16 = lastB16 = 0xFFFFFFFF; // следующий одноцветный кадр должен отрисоваться
+}
+
+// ===== ЦВЕТА =====
+
 uint32_t lerpColor(uint32_t c1, uint32_t c2, float t) {
   int r1 = (c1 >> 16) & 0xFF, g1 = (c1 >> 8) & 0xFF, b1 = c1 & 0xFF;
   int r2 = (c2 >> 16) & 0xFF, g2 = (c2 >> 8) & 0xFF, b2 = c2 & 0xFF;
@@ -2096,96 +2333,394 @@ uint32_t lerpColor(uint32_t c1, uint32_t c2, float t) {
   return ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
 }
 
-// Градиенты рассвета (5 точек для более реалистичного перехода)
-// Глубокий красный → Красный → Оранжевый → Янтарный → Тёплый белый
-void getSunriseGradient(String preset, uint32_t* colors) {
-  if (preset == "classic") {
-    // Классический рассвет: тёмно-красный → оранжевый → тёплый белый
-    colors[0] = 0x990000; // Глубокий тёмно-красный (начало)
-    colors[1] = 0xFF4400; // Красно-оранжевый (середина)
-    colors[2] = 0xFFE4C4; // Тёплый белый bisque (конец)
-  } else if (preset == "warm") {
-    // Тёплый: более оранжевые тона
-    colors[0] = 0x881100; // Тёмный красно-коричневый
-    colors[1] = 0xFF5500; // Оранжевый
-    colors[2] = 0xFFDAAA; // Тёплый персиковый
+// Градиенты рассвета: тёмно-красный -> оранжевый -> тёплый белый
+void getSunriseGradient(const String& preset, const uint32_t* custom, uint32_t* colors) {
+  if (preset == "warm") {
+    colors[0] = 0x881100; colors[1] = 0xFF5500; colors[2] = 0xFFDAAA;
   } else if (preset == "soft") {
-    // Мягкий: менее контрастный
-    colors[0] = 0x663300; // Тёмный янтарный
-    colors[1] = 0xFF7722; // Мягкий оранжевый
-    colors[2] = 0xFFEEDD; // Светлый тёплый белый
-  } else { // custom
-    colors[0] = sunriseColors[0];
-    colors[1] = sunriseColors[1];
-    colors[2] = sunriseColors[2];
+    colors[0] = 0x663300; colors[1] = 0xFF7722; colors[2] = 0xFFEEDD;
+  } else if (preset == "custom") {
+    colors[0] = custom[0]; colors[1] = custom[1]; colors[2] = custom[2];
+  } else { // classic
+    colors[0] = 0x990000; colors[1] = 0xFF4400; colors[2] = 0xFFE4C4;
   }
 }
 
-void setSunriseColor(float progress) {
+// Целевой цвет и яркость для прогресса 0..1 (плавный переход к ним делается в loop)
+void setSunriseTarget(float progress, const String& preset, const uint32_t* custom) {
   uint32_t colors[3];
-  getSunriseGradient(sunrisePreset, colors);
-  
-  uint32_t color;
-  if (progress < 0.5) {
-    color = lerpColor(colors[0], colors[1], progress * 2);
-  } else {
-    color = lerpColor(colors[1], colors[2], (progress - 0.5) * 2);
-  }
-  
-  // Устанавливаем целевые значения (плавный переход делается в loop)
+  getSunriseGradient(preset, custom, colors);
+  uint32_t color = progress < 0.5
+    ? lerpColor(colors[0], colors[1], progress * 2)
+    : lerpColor(colors[1], colors[2], (progress - 0.5) * 2);
   tgtR = (color >> 16) & 0xFF;
   tgtG = (color >> 8) & 0xFF;
   tgtB = color & 0xFF;
-  
-  // Яркость с квадратичной кривой
-  float brightCurve = progress * progress;
-  tgtBr = 1 + brightCurve * 99;
+  tgtBr = progress * 100.0f; // воспринимаемая яркость линейно по времени, гамму накладывает renderColor
 }
 
-// Применить текущий цвет рассвета к ленте
-void applySunriseToStrip() {
-  float mult = curBr / 100.0;
-  uint8_t r = (uint8_t)(curR * mult);
-  uint8_t g = (uint8_t)(curG * mult);
-  uint8_t b = (uint8_t)(curB * mult);
-  
-  for (int i = 0; i < LED_COUNT; i++) {
-    strip.setPixelColor(i, strip.Color(r, g, b));
+// Начальный кадр рассвета: первый цвет градиента на нулевой яркости
+void resetSunriseFrame(const String& preset, const uint32_t* custom) {
+  uint32_t colors[3];
+  getSunriseGradient(preset, custom, colors);
+  curR = tgtR = (colors[0] >> 16) & 0xFF;
+  curG = tgtG = (colors[0] >> 8) & 0xFF;
+  curB = tgtB = colors[0] & 0xFF;
+  curBr = 0;
+  tgtBr = 1;
+}
+
+uint32_t lightPresetColor() {
+  if (lightPreset == "orange") return 0xFF5500;
+  if (lightPreset == "yellow") return 0xFFFF00;
+  if (lightPreset == "white")  return 0xFFFFFF;
+  if (lightPreset == "custom") return customColor;
+  return 0xFF0000; // red
+}
+
+// ===== EEPROM =====
+
+void writeColor(int addr, uint32_t c) {
+  EEPROM.write(addr, (c >> 16) & 0xFF);
+  EEPROM.write(addr + 1, (c >> 8) & 0xFF);
+  EEPROM.write(addr + 2, c & 0xFF);
+}
+
+uint32_t readColor(int addr) {
+  return ((uint32_t)EEPROM.read(addr) << 16) | ((uint32_t)EEPROM.read(addr + 1) << 8) | EEPROM.read(addr + 2);
+}
+
+void writeInt32(int addr, int32_t v) {
+  for (int i = 0; i < 4; i++) EEPROM.write(addr + i, (v >> (8 * i)) & 0xFF);
+}
+
+int32_t readInt32(int addr) {
+  uint32_t v = 0;
+  for (int i = 0; i < 4; i++) v |= (uint32_t)EEPROM.read(addr + i) << (8 * i);
+  return (int32_t)v;
+}
+
+void markSettingsDirty() {
+  settingsDirty = true;
+  settingsDirtySince = millis();
+}
+
+void saveToEEPROM() {
+  EEPROM.write(ADDR_HOUR, alarmHour);
+  EEPROM.write(ADDR_MINUTE, alarmMinute);
+  EEPROM.write(ADDR_ENABLED, alarmEnabled ? 1 : 0);
+  EEPROM.write(ADDR_WEEKDAYS, weekdays);
+  EEPROM.write(ADDR_DURATION, sunriseDuration);
+
+  uint8_t spIdx = 0;
+  if (sunrisePreset == "warm") spIdx = 1;
+  else if (sunrisePreset == "soft") spIdx = 2;
+  else if (sunrisePreset == "custom") spIdx = 3;
+  EEPROM.write(ADDR_SUNRISE_PRESET, spIdx);
+
+  uint8_t lpIdx = 0;
+  if (lightPreset == "orange") lpIdx = 1;
+  else if (lightPreset == "yellow") lpIdx = 2;
+  else if (lightPreset == "white") lpIdx = 3;
+  else if (lightPreset == "rainbow") lpIdx = 4;
+  else if (lightPreset == "custom") lpIdx = 5;
+  EEPROM.write(ADDR_LIGHT_PRESET, lpIdx);
+  writeColor(ADDR_CUSTOM_COLOR, customColor);
+
+  uint8_t aaIdx = 1;
+  if (afterAlarm == "keep") aaIdx = 0;
+  else if (afterAlarm == "60") aaIdx = 2;
+  EEPROM.write(ADDR_AFTER_ALARM, aaIdx);
+
+  EEPROM.write(ADDR_SMOOTHNESS, smoothness);
+  EEPROM.write(ADDR_AUTO_OFF, autoOffMinutes);
+
+  writeColor(ADDR_SUNRISE_C1, sunriseColors[0]);
+  writeColor(ADDR_SUNRISE_C2, sunriseColors[1]);
+  writeColor(ADDR_SUNRISE_C3, sunriseColors[2]);
+
+  writeInt32(ADDR_DISMISSED_KEY, dismissedKey);
+  EEPROM.write(ADDR_MAGIC, MAGIC_VALUE);
+
+  EEPROM.commit();
+  settingsDirty = false;
+}
+
+// Отложенная запись: commit не чаще чем через EEPROM_COMMIT_DELAY после последнего изменения
+void handleEepromCommit() {
+  if (settingsDirty && millis() - settingsDirtySince > EEPROM_COMMIT_DELAY) {
+    saveToEEPROM();
+    logMsg("EEPROM: настройки сохранены");
   }
-  showStrip();
 }
 
-void applyLightPreset() {
-  if (currentBrightness == 0) {
-    turnOff();
+void resetToDefaults();
+
+void loadFromEEPROM() {
+  if (EEPROM.read(ADDR_MAGIC) != MAGIC_VALUE) {
+    logMsg("EEPROM: первая загрузка, настройки по умолчанию");
+    resetToDefaults();
     return;
   }
-  
-  if (lightPreset == "rainbow") {
-    rainbowCycle();
-  } else {
-    uint8_t r = (currentColor >> 16) & 0xFF;
-    uint8_t g = (currentColor >> 8) & 0xFF;
-    uint8_t b = currentColor & 0xFF;
-    setAllLeds(r, g, b, currentBrightness);
-  }
+
+  alarmHour = EEPROM.read(ADDR_HOUR);
+  alarmMinute = EEPROM.read(ADDR_MINUTE);
+  alarmEnabled = EEPROM.read(ADDR_ENABLED) == 1;
+  weekdays = EEPROM.read(ADDR_WEEKDAYS);
+  sunriseDuration = EEPROM.read(ADDR_DURATION);
+
+  uint8_t spIdx = EEPROM.read(ADDR_SUNRISE_PRESET);
+  sunrisePreset = spIdx == 1 ? "warm" : spIdx == 2 ? "soft" : spIdx == 3 ? "custom" : "classic";
+
+  uint8_t lpIdx = EEPROM.read(ADDR_LIGHT_PRESET);
+  const char* lps[] = {"red", "orange", "yellow", "white", "rainbow", "custom"};
+  lightPreset = lpIdx < 6 ? lps[lpIdx] : "red";
+  customColor = readColor(ADDR_CUSTOM_COLOR);
+
+  uint8_t aaIdx = EEPROM.read(ADDR_AFTER_ALARM);
+  afterAlarm = aaIdx == 0 ? "keep" : aaIdx == 2 ? "60" : "30";
+
+  smoothness = EEPROM.read(ADDR_SMOOTHNESS);
+  autoOffMinutes = EEPROM.read(ADDR_AUTO_OFF);
+
+  sunriseColors[0] = readColor(ADDR_SUNRISE_C1);
+  sunriseColors[1] = readColor(ADDR_SUNRISE_C2);
+  sunriseColors[2] = readColor(ADDR_SUNRISE_C3);
+
+  dismissedKey = readInt32(ADDR_DISMISSED_KEY); // 0xFFFFFFFF на чистой флеш = -1 = ничего не выключено
+
+  // Валидация (0 дней недели - допустимо, пользователь так решил)
+  if (alarmHour > 23) alarmHour = 7;
+  if (alarmMinute > 59) alarmMinute = 30;
+  if (sunriseDuration < 5 || sunriseDuration > 60) sunriseDuration = 20;
+  if (weekdays > 127) weekdays = 0b00011111;
+  if (smoothness > 10) smoothness = 5;
+  if (autoOffMinutes > 120) autoOffMinutes = 5;
 }
 
-void rainbowCycle() {
-  static uint16_t j = 0;
-  float mult = currentBrightness / 100.0;
-  for (int i = 0; i < LED_COUNT; i++) {
-    uint32_t color = strip.ColorHSV((i * 65536 / LED_COUNT + j) % 65536);
-    uint8_t r = ((color >> 16) & 0xFF) * mult;
-    uint8_t g = ((color >> 8) & 0xFF) * mult;
-    uint8_t b = (color & 0xFF) * mult;
-    strip.setPixelColor(i, r, g, b);
+void resetToDefaults() {
+  phase = PHASE_IDLE;
+  demoActive = false;
+  snoozeUntil = 0;
+  activeKey = -1;
+  dismissedKey = -1;
+  curR = curG = curB = curBr = 0;
+  tgtR = tgtG = tgtB = tgtBr = 0;
+
+  alarmHour = 7;
+  alarmMinute = 30;
+  alarmEnabled = true;
+  weekdays = 0b00011111;
+  sunriseDuration = 20;
+  sunrisePreset = "classic";
+  afterAlarm = "30";
+  sunriseColors[0] = 0x990000;
+  sunriseColors[1] = 0xFF4400;
+  sunriseColors[2] = 0xFFE4C4;
+
+  brightness = 0;
+  currentBrightness = 0;
+  lightPreset = "red";
+  customColor = 0xFF5500;
+
+  smoothness = 5;
+  autoOffMinutes = 5;
+
+  saveToEEPROM();
+  renderOff();
+}
+
+// ===== БУДИЛЬНИК =====
+// Запуск будильника = конкретная дата + время. Ключ: день от 1970 (локальный) * 1440 + минута будильника.
+// По ключу помним, какой запуск пользователь уже выключил, чтобы он не включался снова в том же окне.
+
+int32_t occurrenceKey(long day) {
+  return (int32_t)(day * 1440L + alarmHour * 60L + alarmMinute);
+}
+
+bool weekdayAllowed(long day) {
+  int dow = (day + 3) % 7; // 1970-01-01 был четверг: день 0 -> 3 (0=пн ... 6=вс)
+  return weekdays & (1 << dow);
+}
+
+// Ищем запуск, в окно которого попадает "сейчас": вчерашний, сегодняшний или завтрашний
+// (рассвет через полночь относится к дню будильника, и день недели проверяется по нему)
+AlarmWindow findWindow(long nowLocal) {
+  AlarmWindow w = {false, false, 0, -1};
+  if (!alarmEnabled) return w;
+
+  long today = nowLocal / 86400L;
+  long alarmSec = alarmHour * 3600L + alarmMinute * 60L;
+  long durSec = sunriseDuration * 60L;
+
+  for (long day = today - 1; day <= today + 1; day++) {
+    if (!weekdayAllowed(day)) continue;
+    long alarmAt = day * 86400L + alarmSec;
+    long start = alarmAt - durSec;
+    long holdEnd = alarmAt + 5 * 60; // ещё 5 минут после времени будильника считаем его сработавшим
+
+    if (nowLocal >= start && nowLocal < alarmAt) {
+      w.active = true; w.inSunrise = true;
+      w.progress = (float)(nowLocal - start) / durSec;
+      w.key = occurrenceKey(day);
+      return w;
+    }
+    if (nowLocal >= alarmAt && nowLocal < holdEnd) {
+      w.active = true; w.inSunrise = false;
+      w.progress = 1.0f;
+      w.key = occurrenceKey(day);
+      return w;
+    }
   }
-  showStrip();
-  j += 256;
+  return w;
+}
+
+void logTime(const char* msg) {
+  logMsg("%s", msg);
+}
+
+void enterSunrise(const AlarmWindow& w) {
+  phase = PHASE_SUNRISE;
+  activeKey = w.key;
+  sunriseProgress = w.progress;
+  resetSunriseFrame(sunrisePreset, sunriseColors);
+  logTime("Рассвет начался");
+}
+
+void enterHold(int32_t key) {
+  if (phase != PHASE_SUNRISE) {
+    // Пришли не из рассвета (загрузка в окне, конец snooze) - стартуем с нуля, яркость плавно поднимется
+    resetSunriseFrame(sunrisePreset, sunriseColors);
+  }
+  phase = PHASE_HOLD;
+  activeKey = key;
+  sunriseProgress = 1.0f;
+  holdStartMillis = millis();
+  logTime("Будильник: время наступило, держим свет");
+}
+
+// Будильник погашен сам (таймаут, выключили тумблером, день стал неактивным)
+void stopAlarm(const char* why) {
+  if (phase == PHASE_IDLE) return;
+  phase = PHASE_IDLE;
+  activeKey = -1;
+  curR = curG = curB = curBr = 0;
+  brightness = 0;
+  currentBrightness = 0;
+  renderOff();
+  logTime(why);
+}
+
+// Пользователь выключил будильник: этот запуск больше не включаем, помним это и после перезагрузки
+void dismissAlarm() {
+  if (phase == PHASE_IDLE && snoozeUntil == 0) return;
+  if (activeKey >= 0 && activeKey != dismissedKey) {
+    dismissedKey = activeKey;
+    writeInt32(ADDR_DISMISSED_KEY, dismissedKey);
+    EEPROM.commit(); // редкое событие, пишем сразу
+  }
+  snoozeUntil = 0;
+  stopAlarm("Будильник выключен пользователем");
+}
+
+// Отложить на 5 минут: гасим, помечаем текущий запуск выключенным, через 5 минут включаем удержание
+bool snoozeAlarm() {
+  long nowLocal;
+  if (!getLocalEpoch(nowLocal)) return false;
+  if (phase == PHASE_IDLE && snoozeUntil == 0) return false;
+
+  if (activeKey >= 0 && activeKey != dismissedKey) {
+    dismissedKey = activeKey;
+    writeInt32(ADDR_DISMISSED_KEY, dismissedKey);
+    EEPROM.commit();
+  }
+  int32_t key = activeKey;
+  stopAlarm("Будильник отложен на 5 минут");
+  activeKey = key; // нужен, чтобы по окончании snooze удержание можно было выключить тем же ключом
+  snoozeUntil = nowLocal + 5 * 60;
+  return true;
+}
+
+void checkAlarm() {
+  long nowLocal;
+  if (!getLocalEpoch(nowLocal)) {
+    static unsigned long lastWarn = 0;
+    if (millis() - lastWarn > 60000) {
+      lastWarn = millis();
+      logMsg("Будильник: нет источника времени (ни NTP, ни RTC) - ждём");
+    }
+    return;
+  }
+
+  // Отложенный будильник
+  if (snoozeUntil > 0 && nowLocal >= snoozeUntil) {
+    snoozeUntil = 0;
+    if (!alarmEnabled) { activeKey = -1; return; }
+    enterHold(activeKey);
+    return;
+  }
+
+  if (phase == PHASE_HOLD) {
+    if (!alarmEnabled) { stopAlarm("Будильник выключен тумблером"); return; }
+    if (afterAlarm == "keep") return;
+    unsigned long timeout = (afterAlarm == "60" ? 60UL : 30UL) * 60UL * 1000UL;
+    if (millis() - holdStartMillis > timeout) stopAlarm("Свет выключен по таймеру после будильника");
+    return;
+  }
+
+  AlarmWindow w = findWindow(nowLocal);
+
+  if (phase == PHASE_SUNRISE) {
+    if (!w.active || w.key != activeKey) { stopAlarm("Рассвет прерван: будильник выключен или время изменилось"); return; }
+    if (!w.inSunrise) { enterHold(w.key); return; }
+    sunriseProgress = w.progress; // длительность могла измениться - прогресс пересчитан
+    return;
+  }
+
+  // PHASE_IDLE
+  if (!w.active || w.key == dismissedKey || snoozeUntil > 0) return;
+
+  if (brightness > 0 || currentBrightness > 0) {
+    // Свет уже включён руками - человек не спит, этот запуск пропускаем целиком
+    dismissedKey = w.key;
+    writeInt32(ADDR_DISMISSED_KEY, dismissedKey);
+    EEPROM.commit();
+    logTime("Будильник пропущен: свет уже включён вручную");
+    return;
+  }
+
+  if (w.inSunrise) enterSunrise(w);
+  else enterHold(w.key);
 }
 
 // ===== HTTP HANDLERS =====
+
+bool argInt(const char* name, int lo, int hi, int& out) {
+  if (!server.hasArg(name)) return false;
+  long v = server.arg(name).toInt();
+  if (v < lo || v > hi) return false;
+  out = (int)v;
+  return true;
+}
+
+bool argColor(const char* name, uint32_t& out) {
+  if (!server.hasArg(name)) return false;
+  String s = server.arg(name);
+  if (s.length() < 1 || s.length() > 6) return false;
+  out = strtoul(s.c_str(), nullptr, 16) & 0xFFFFFF;
+  return true;
+}
+
+bool argOneOf(const char* name, const char* const* allowed, int n, String& out) {
+  if (!server.hasArg(name)) return false;
+  String v = server.arg(name);
+  for (int i = 0; i < n; i++) if (v == allowed[i]) { out = v; return true; }
+  return false;
+}
+
+const char* const SUNRISE_PRESETS[] = {"classic", "warm", "soft", "custom"};
+const char* const LIGHT_PRESETS[] = {"red", "orange", "yellow", "white", "rainbow", "custom"};
+const char* const AFTER_ALARM_VALUES[] = {"keep", "30", "60"};
 
 void handleRoot() {
   server.send_P(200, "text/html", HTML_PAGE);
@@ -2196,612 +2731,173 @@ void handleManifest() {
 }
 
 void handleStatus() {
-  char c1[7], c2[7], c3[7];
-  sprintf(c1, "%06X", sunriseColors[0]);
-  sprintf(c2, "%06X", sunriseColors[1]);
-  sprintf(c3, "%06X", sunriseColors[2]);
-  
-  String json = "{";
-  json += "\"h\":" + String(alarmHour) + ",";
-  json += "\"m\":" + String(alarmMinute) + ",";
-  json += "\"en\":" + String(alarmEnabled ? "true" : "false") + ",";
-  json += "\"wd\":" + String(weekdays) + ",";
-  json += "\"dur\":" + String(sunriseDuration) + ",";
-  json += "\"sp\":\"" + sunrisePreset + "\",";
-  json += "\"b\":" + String(brightness) + ",";
-  json += "\"lp\":\"" + lightPreset + "\",";
-  json += "\"aa\":\"" + afterAlarm + "\",";
-  json += "\"c1\":\"" + String(c1) + "\",";
-  json += "\"c2\":\"" + String(c2) + "\",";
-  json += "\"c3\":\"" + String(c3) + "\",";
-  json += "\"wifi\":\"" + String(ssid) + "\",";
-  json += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
-  json += "\"sunrise\":" + String((sunriseActive || alarmTriggered || demoActive) ? "true" : "false") + ",";
-  json += "\"smooth\":" + String(smoothness) + ",";
-  json += "\"csmooth\":" + String(colorSmoothness) + ",";
-  json += "\"aoff\":" + String(autoOffMinutes) + ",";
-  json += "\"ntp\":" + String(ntpSynced ? "true" : "false");
-  json += "}";
-  
+  char timeBuf[12];
+  formatLocalTime(timeBuf, sizeof timeBuf);
+
+  char snoozeBuf[8] = "";
+  if (snoozeUntil > 0) {
+    long s = snoozeUntil % 86400;
+    snprintf(snoozeBuf, sizeof snoozeBuf, "%02ld:%02ld", s / 3600, (s / 60) % 60);
+  }
+
+  const char* phaseName = demoActive ? "demo" : phase == PHASE_SUNRISE ? "sunrise" : phase == PHASE_HOLD ? "hold" : "idle";
+  bool wifiOk = WiFi.status() == WL_CONNECTED;
+
+  static char json[640];
+  snprintf(json, sizeof json,
+    "{\"h\":%d,\"m\":%d,\"en\":%s,\"wd\":%u,\"dur\":%d,\"sp\":\"%s\","
+    "\"b\":%d,\"lp\":\"%s\",\"c\":\"%06X\",\"aa\":\"%s\","
+    "\"c1\":\"%06X\",\"c2\":\"%06X\",\"c3\":\"%06X\",\"smooth\":%d,\"aoff\":%d,"
+    "\"sunrise\":%s,\"phase\":\"%s\",\"snz\":\"%s\","
+    "\"wifi\":\"%s\",\"ip\":\"%s\",\"rssi\":%d,\"ntp\":%s,\"rtc\":%s,\"tsrc\":\"%s\",\"time\":\"%s\",\"up\":%lu}",
+    alarmHour, alarmMinute, alarmEnabled ? "true" : "false", weekdays, sunriseDuration, sunrisePreset.c_str(),
+    brightness, lightPreset.c_str(), customColor, afterAlarm.c_str(),
+    sunriseColors[0], sunriseColors[1], sunriseColors[2], smoothness, autoOffMinutes,
+    (phase != PHASE_IDLE || demoActive) ? "true" : "false", phaseName, snoozeBuf,
+    wifiOk ? ssid : "", wifiOk ? WiFi.localIP().toString().c_str() : "", wifiOk ? WiFi.RSSI() : 0,
+    ntpSynced ? "true" : "false", rtcFound ? "true" : "false", timeSource(), timeBuf, millis() / 1000);
+
   server.send(200, "application/json", json);
 }
 
 void handleSave() {
-  // Сбрасываем флаг выключения если меняется время будильника
-  if (server.hasArg("h") || server.hasArg("m")) {
-    alarmDismissedAt = -1;
-  }
-  
-  if (server.hasArg("h")) alarmHour = server.arg("h").toInt();
-  if (server.hasArg("m")) alarmMinute = server.arg("m").toInt();
-  if (server.hasArg("en")) alarmEnabled = server.arg("en").toInt() == 1;
-  if (server.hasArg("wd")) weekdays = server.arg("wd").toInt();
-  if (server.hasArg("dur")) sunriseDuration = server.arg("dur").toInt();
-  if (server.hasArg("sp")) sunrisePreset = server.arg("sp");
-  if (server.hasArg("aa")) afterAlarm = server.arg("aa");
-  if (server.hasArg("smooth")) smoothness = server.arg("smooth").toInt();
-  if (server.hasArg("csmooth")) colorSmoothness = server.arg("csmooth").toInt();
-  if (server.hasArg("aoff")) autoOffMinutes = server.arg("aoff").toInt();
-  
-  if (server.hasArg("c1")) {
-    sunriseColors[0] = strtol(server.arg("c1").c_str(), NULL, 16);
-  }
-  if (server.hasArg("c2")) {
-    sunriseColors[1] = strtol(server.arg("c2").c_str(), NULL, 16);
-  }
-  if (server.hasArg("c3")) {
-    sunriseColors[2] = strtol(server.arg("c3").c_str(), NULL, 16);
-  }
-  
-  saveToEEPROM();
+  argInt("h", 0, 23, alarmHour);
+  argInt("m", 0, 59, alarmMinute);
+  int en;
+  if (argInt("en", 0, 1, en)) alarmEnabled = en == 1;
+  int wd;
+  if (argInt("wd", 0, 127, wd)) weekdays = wd;
+  argInt("dur", 5, 60, sunriseDuration);
+  argOneOf("sp", SUNRISE_PRESETS, 4, sunrisePreset);
+  argOneOf("aa", AFTER_ALARM_VALUES, 3, afterAlarm);
+  argInt("smooth", 0, 10, smoothness);
+  argInt("aoff", 0, 120, autoOffMinutes);
+  argColor("c1", sunriseColors[0]);
+  argColor("c2", sunriseColors[1]);
+  argColor("c3", sunriseColors[2]);
+
+  markSettingsDirty();
   server.send(200, "text/plain", "OK");
 }
 
 void handleLight() {
-  lastInteractionTime = millis(); // Сброс таймера автовыключения
-  
-  bool presetChanged = false;
-  
-  if (server.hasArg("p")) {
-    String newPreset = server.arg("p");
-    if (newPreset != lightPreset) {
-      lightPreset = newPreset;
-      presetChanged = true;
-      
-      // Если меняем пресет во время будильника — dismiss
-      if (sunriseActive || alarmTriggered) {
-        DateTime now = rtc.now();
-        alarmDismissedAt = now.hour() * 60 + now.minute();
-        sunriseActive = false;
-        alarmTriggered = false;
-        curR = 0; curG = 0; curB = 0; curBr = 0;
-      }
-    }
-    // Устанавливаем целевой цвет по пресету
-    if (lightPreset == "red") targetColor = 0xFF0000;
-    else if (lightPreset == "orange") targetColor = 0xFF5500;
-    else if (lightPreset == "yellow") targetColor = 0xFFFF00;
-    else if (lightPreset == "white") targetColor = 0xFFFFFF;
-    else if (lightPreset == "custom") targetColor = customColor;
+  lastInteractionTime = millis();
+
+  String newPreset;
+  bool presetChanged = argOneOf("p", LIGHT_PRESETS, 6, newPreset) && newPreset != lightPreset;
+  uint32_t newColor;
+  bool colorChanged = argColor("c", newColor) && newColor != customColor;
+  int newBrightness;
+  bool hasBrightness = argInt("b", 0, 100, newBrightness);
+
+  // Любое ручное действие со светом во время будильника - будильник выключен
+  if (phase != PHASE_IDLE || snoozeUntil > 0) {
+    if (hasBrightness || presetChanged) dismissAlarm();
   }
-  
-  if (server.hasArg("c")) {
-    uint32_t newColor = strtol(server.arg("c").c_str(), NULL, 16);
-    if (newColor != customColor) {
-      customColor = newColor;
-      if (lightPreset == "custom") {
-        targetColor = customColor;
-        presetChanged = true;
-      }
-    }
+  if (demoActive && hasBrightness) {
+    demoActive = false;
+    curR = curG = curB = curBr = 0;
   }
-  
-  if (server.hasArg("b")) {
-    brightness = server.arg("b").toInt();
-    targetBrightness = brightness;
-    
-    // Если яркость 0 — выключаем всё
+
+  if (presetChanged) { lightPreset = newPreset; markSettingsDirty(); }
+  if (colorChanged) { customColor = newColor; markSettingsDirty(); }
+  if (hasBrightness) {
+    brightness = newBrightness;
     if (brightness == 0) {
-      if (sunriseActive || alarmTriggered) {
-        DateTime now = rtc.now();
-        alarmDismissedAt = now.hour() * 60 + now.minute();
-        Serial.println("🛑 Будильник выключен (dismissed at " + String(alarmDismissedAt / 60) + ":" + String(alarmDismissedAt % 60) + ")");
-      }
-      demoActive = false;
-      sunriseActive = false;
-      alarmTriggered = false;
       currentBrightness = 0;
-      turnOff();
-    }
-    // Если яркость > 0 — прерываем рассвет/демо
-    else if (sunriseActive || alarmTriggered || demoActive) {
-      // Если был активен будильник — помечаем как dismissed
-      if (sunriseActive || alarmTriggered) {
-        DateTime now = rtc.now();
-        alarmDismissedAt = now.hour() * 60 + now.minute();
-      }
-      sunriseActive = false;
-      alarmTriggered = false;
-      demoActive = false;
-      curR = 0; curG = 0; curB = 0; curBr = 0;
+      renderOff();
     }
   }
-  
-  // Если пресет/цвет изменился и свет включен — применить сразу
-  if (presetChanged && currentBrightness > 0 && lightPreset != "rainbow") {
-    currentColor = targetColor;
-    applyLightPreset();
-  }
-  
+
   server.send(200, "text/plain", "OK");
 }
 
 void handleDemo() {
-  if (server.hasArg("start")) {
-    int start = server.arg("start").toInt();
-    if (start == 1) {
-      // Устанавливаем пресет если передан
-      if (server.hasArg("preset")) {
-        sunrisePreset = server.arg("preset");
-      }
-      // Устанавливаем кастомные цвета если переданы
-      if (server.hasArg("c1")) {
-        sunriseColors[0] = strtol(server.arg("c1").c_str(), NULL, 16);
-      }
-      if (server.hasArg("c2")) {
-        sunriseColors[1] = strtol(server.arg("c2").c_str(), NULL, 16);
-      }
-      if (server.hasArg("c3")) {
-        sunriseColors[2] = strtol(server.arg("c3").c_str(), NULL, 16);
-      }
-      // Сбрасываем текущее состояние перед запуском демо
-      sunriseActive = false;
-      alarmTriggered = false;
-      currentBrightness = 0;
-      targetBrightness = 0;
-      brightness = 0;
-      
-      // Получаем начальный цвет градиента и сразу устанавливаем его
-      uint32_t colors[3];
-      getSunriseGradient(sunrisePreset, colors);
-      curR = (colors[0] >> 16) & 0xFF;
-      curG = (colors[0] >> 8) & 0xFF;
-      curB = colors[0] & 0xFF;
-      curBr = 0; // Яркость начинается с 0
-      tgtR = curR; tgtG = curG; tgtB = curB;
-      tgtBr = 1; // Начальная целевая яркость
-      
-      demoActive = true;
-      demoStartTime = millis();
-      if (server.hasArg("speed")) {
-        demoSpeed = server.arg("speed").toInt();
-        if (demoSpeed <= 0) demoSpeed = 30;
-      }
-    } else {
-      // Если был активен будильник — помечаем как dismissed
-      if (sunriseActive || alarmTriggered) {
-        DateTime now = rtc.now();
-        alarmDismissedAt = now.hour() * 60 + now.minute();
-        Serial.println("🛑 Будильник выключен через OFF (dismissed at " + String(alarmDismissedAt / 60) + ":" + String(alarmDismissedAt % 60) + ")");
-      }
+  int start;
+  if (!argInt("start", 0, 1, start)) { server.send(400, "text/plain", "start=0|1"); return; }
+
+  if (start == 1) {
+    if (phase != PHASE_IDLE || snoozeUntil > 0) dismissAlarm();
+
+    // Демо показывает переданный пресет/цвета, не трогая настройки будильника
+    demoPreset = sunrisePreset;
+    argOneOf("preset", SUNRISE_PRESETS, 4, demoPreset);
+    demoColors[0] = sunriseColors[0];
+    demoColors[1] = sunriseColors[1];
+    demoColors[2] = sunriseColors[2];
+    argColor("c1", demoColors[0]);
+    argColor("c2", demoColors[1]);
+    argColor("c3", demoColors[2]);
+    if (!argInt("speed", 5, 600, demoSpeed)) demoSpeed = 30;
+
+    brightness = 0;
+    currentBrightness = 0;
+    resetSunriseFrame(demoPreset, demoColors);
+    demoActive = true;
+    demoStartTime = millis();
+  } else {
+    // Только останавливает демо. Будильник выключается через /light?b=0, откладывается через /snooze -
+    // UI шлёт эти запросы вместе с /demo?start=0, и их порядок не должен иметь значения
+    if (demoActive) {
       demoActive = false;
-      sunriseActive = false;
-      alarmTriggered = false;
-      currentBrightness = 0;
-      targetBrightness = 0;
       brightness = 0;
-      curR = 0; curG = 0; curB = 0; curBr = 0;
-      currentColor = targetColor;
-      turnOff();
+      currentBrightness = 0;
+      curR = curG = curB = curBr = 0;
+      renderOff();
     }
   }
   server.send(200, "text/plain", "OK");
 }
 
 void handleSnooze() {
-  // Откладываем будильник на 5 минут
-  sunriseActive = false;
-  alarmTriggered = false;
-  demoActive = false;
-  alarmDismissedAt = -1; // Сбрасываем чтобы будильник мог сработать снова
-  curR = 0; curG = 0; curB = 0; curBr = 0;
-  turnOff();
-  currentBrightness = 0;
-  targetBrightness = 0;
-  
-  // Сдвигаем время будильника на 5 минут вперёд (только на сегодня)
-  alarmMinute += 5;
-  if (alarmMinute >= 60) {
-    alarmMinute -= 60;
-    alarmHour++;
-    if (alarmHour >= 24) alarmHour = 0;
-  }
-  
-  server.send(200, "text/plain", "OK");
-}
-
-// ===== EEPROM =====
-
-void saveToEEPROM() {
-  EEPROM.write(ADDR_HOUR, alarmHour);
-  EEPROM.write(ADDR_MINUTE, alarmMinute);
-  EEPROM.write(ADDR_ENABLED, alarmEnabled ? 1 : 0);
-  EEPROM.write(ADDR_WEEKDAYS, weekdays);
-  EEPROM.write(ADDR_DURATION, sunriseDuration);
-  
-  uint8_t spIdx = 0;
-  if (sunrisePreset == "warm") spIdx = 1;
-  else if (sunrisePreset == "soft") spIdx = 2;
-  else if (sunrisePreset == "custom") spIdx = 3;
-  EEPROM.write(ADDR_SUNRISE_PRESET, spIdx);
-  
-  uint8_t aaIdx = 1;
-  if (afterAlarm == "keep") aaIdx = 0;
-  else if (afterAlarm == "60") aaIdx = 2;
-  EEPROM.write(ADDR_AFTER_ALARM, aaIdx);
-  
-  EEPROM.write(ADDR_SMOOTHNESS, smoothness);
-  EEPROM.write(ADDR_COLOR_SMOOTHNESS, colorSmoothness);
-  EEPROM.write(ADDR_AUTO_OFF, autoOffMinutes);
-  
-  // Sunrise colors
-  EEPROM.write(ADDR_SUNRISE_C1, (sunriseColors[0] >> 16) & 0xFF);
-  EEPROM.write(ADDR_SUNRISE_C1 + 1, (sunriseColors[0] >> 8) & 0xFF);
-  EEPROM.write(ADDR_SUNRISE_C1 + 2, sunriseColors[0] & 0xFF);
-  
-  EEPROM.write(ADDR_SUNRISE_C2, (sunriseColors[1] >> 16) & 0xFF);
-  EEPROM.write(ADDR_SUNRISE_C2 + 1, (sunriseColors[1] >> 8) & 0xFF);
-  EEPROM.write(ADDR_SUNRISE_C2 + 2, sunriseColors[1] & 0xFF);
-  
-  EEPROM.write(ADDR_SUNRISE_C3, (sunriseColors[2] >> 16) & 0xFF);
-  EEPROM.write(ADDR_SUNRISE_C3 + 1, (sunriseColors[2] >> 8) & 0xFF);
-  EEPROM.write(ADDR_SUNRISE_C3 + 2, sunriseColors[2] & 0xFF);
-  
-  EEPROM.write(ADDR_MAGIC, MAGIC_VALUE);
-  
-  EEPROM.commit();
-  yield(); // Даём время завершить запись
-}
-
-void loadFromEEPROM() {
-  // Проверяем магическое число - если не совпадает, сброс на дефолты
-  if (EEPROM.read(ADDR_MAGIC) != MAGIC_VALUE) {
-    resetToDefaults();
-    return;
-  }
-  
-  alarmHour = EEPROM.read(ADDR_HOUR);
-  alarmMinute = EEPROM.read(ADDR_MINUTE);
-  alarmEnabled = EEPROM.read(ADDR_ENABLED) == 1;
-  weekdays = EEPROM.read(ADDR_WEEKDAYS);
-  sunriseDuration = EEPROM.read(ADDR_DURATION);
-  
-  uint8_t spIdx = EEPROM.read(ADDR_SUNRISE_PRESET);
-  if (spIdx == 1) sunrisePreset = "warm";
-  else if (spIdx == 2) sunrisePreset = "soft";
-  else if (spIdx == 3) sunrisePreset = "custom";
-  else sunrisePreset = "classic";
-  
-  uint8_t aaIdx = EEPROM.read(ADDR_AFTER_ALARM);
-  if (aaIdx == 0) afterAlarm = "keep";
-  else if (aaIdx == 2) afterAlarm = "60";
-  else afterAlarm = "30";
-  
-  smoothness = EEPROM.read(ADDR_SMOOTHNESS);
-  colorSmoothness = EEPROM.read(ADDR_COLOR_SMOOTHNESS);
-  autoOffMinutes = EEPROM.read(ADDR_AUTO_OFF);
-  
-  sunriseColors[0] = ((uint32_t)EEPROM.read(ADDR_SUNRISE_C1) << 16) | 
-                     ((uint32_t)EEPROM.read(ADDR_SUNRISE_C1 + 1) << 8) | 
-                     EEPROM.read(ADDR_SUNRISE_C1 + 2);
-  sunriseColors[1] = ((uint32_t)EEPROM.read(ADDR_SUNRISE_C2) << 16) | 
-                     ((uint32_t)EEPROM.read(ADDR_SUNRISE_C2 + 1) << 8) | 
-                     EEPROM.read(ADDR_SUNRISE_C2 + 2);
-  sunriseColors[2] = ((uint32_t)EEPROM.read(ADDR_SUNRISE_C3) << 16) | 
-                     ((uint32_t)EEPROM.read(ADDR_SUNRISE_C3 + 1) << 8) | 
-                     EEPROM.read(ADDR_SUNRISE_C3 + 2);
-  
-  // Валидация
-  if (alarmHour > 23) alarmHour = 7;
-  if (alarmMinute > 59) alarmMinute = 30;
-  if (sunriseDuration < 5 || sunriseDuration > 60) sunriseDuration = 20;
-  if (weekdays == 0 || weekdays == 255) weekdays = 0b00011111;
-  if (smoothness < 0 || smoothness > 10) smoothness = 5;
-  if (colorSmoothness < 0 || colorSmoothness > 10) colorSmoothness = 5;
-  if (autoOffMinutes < 0 || autoOffMinutes > 120) autoOffMinutes = 30;
-  
-  // Если цвета не инициализированы или старые - ставим дефолтные
-  bool colorsInvalid = (sunriseColors[0] == 0 && sunriseColors[1] == 0 && sunriseColors[2] == 0) ||
-                       sunriseColors[0] == 0xFFFFFF || sunriseColors[1] == 0xFFFFFF || sunriseColors[2] == 0xFFFFFF ||
-                       sunriseColors[0] == 0xFF4444 || sunriseColors[1] == 0xFF8844 || sunriseColors[2] == 0xFFDD44 ||
-                       sunriseColors[0] == 0xFF0000; // Старые красные цвета тоже обновить
-  if (colorsInvalid) {
-    sunriseColors[0] = 0x990000;  // Глубокий тёмно-красный
-    sunriseColors[1] = 0xFF4400;  // Красно-оранжевый
-    sunriseColors[2] = 0xFFE4C4;  // Тёплый белый
-    // Принудительно переключаем на classic
-    sunrisePreset = "classic";
-    // Сохраняем исправленные значения
-    saveToEEPROM();
-  }
-}
-
-void resetToDefaults() {
-  // Сброс всех флагов состояния
-  sunriseActive = false;
-  alarmTriggered = false;
-  demoActive = false;
-  alarmDismissedAt = -1;
-  
-  // Сброс переменных рассвета
-  curR = 0; curG = 0; curB = 0; curBr = 0;
-  tgtR = 0; tgtG = 0; tgtB = 0; tgtBr = 0;
-  sunriseStartMillis = 0;
-  sunriseDurationMillis = 0;
-  
-  // Будильник
-  alarmHour = 7;
-  alarmMinute = 30;
-  alarmEnabled = true;
-  weekdays = 0b00011111; // пн-пт
-  sunriseDuration = 20;
-  sunrisePreset = "classic";
-  afterAlarm = "30";
-  
-  // Цвета рассвета (реалистичные)
-  sunriseColors[0] = 0x990000;  // Глубокий тёмно-красный
-  sunriseColors[1] = 0xFF4400;  // Красно-оранжевый
-  sunriseColors[2] = 0xFFE4C4;  // Тёплый белый
-  
-  // Свет
-  brightness = 0;
-  currentBrightness = 0;
-  targetBrightness = 0;
-  lightPreset = "red";
-  customColor = 0xFF5500;
-  currentColor = 0xFF0000;
-  targetColor = 0xFF0000;
-  
-  // Настройки
-  smoothness = 5;
-  colorSmoothness = 5;
-  autoOffMinutes = 5;
-  
-  // Сохраняем
-  saveToEEPROM();
-  
-  // Выключаем свет
-  turnOff();
+  server.send(200, "text/plain", snoozeAlarm() ? "OK" : "NOTHING_TO_SNOOZE");
 }
 
 void handleReset() {
-  // Сначала сбрасываем и сохраняем
   resetToDefaults();
-  
-  // Потом отправляем ответ
   server.send(200, "text/plain", "OK");
-  delay(500); // Даём время отправить ответ
-  
-  // Перезагружаем ESP для чистого старта
+  delay(500); // отдать ответ
   ESP.restart();
 }
 
-// ===== ALARM CHECK =====
-
-void checkAlarm() {
-  if (!alarmEnabled) {
-    if (sunriseActive) {
-      sunriseActive = false;
-      turnOff();
-    }
-    return;
+void handleLog() {
+  String out;
+  out.reserve(logCount * 60 + 160);
+  out += "Рассвет-будильник v3\n";
+  out += "Аптайм: " + String(millis() / 60000) + " мин, свободно памяти: " + String(ESP.getFreeHeap()) + " байт\n";
+  out += "Фаза: " + String(phase == PHASE_IDLE ? "ожидание" : phase == PHASE_SUNRISE ? "рассвет" : "удержание");
+  out += ", источник времени: " + String(timeSource()) + "\n\n";
+  uint8_t start = (logHead + LOG_LINES - logCount) % LOG_LINES;
+  for (uint8_t i = 0; i < logCount; i++) {
+    out += logBuf[(start + i) % LOG_LINES];
+    out += '\n';
   }
-  
-  DateTime now = rtc.now();
-  
-  // Проверяем день недели (RTC: 0=вс, 1=пн, ... 6=сб)
-  // Наши биты: 0=пн, 1=вт, ... 6=вс
-  int rtcDow = now.dayOfTheWeek(); // 0=Sunday
-  int ourDow = (rtcDow + 6) % 7;   // Конвертируем: 0=пн, 6=вс
-  
-  if (!(weekdays & (1 << ourDow))) {
-    // Сегодня будильник не активен
-    if (sunriseActive) {
-      sunriseActive = false;
-      turnOff();
-    }
-    return;
-  }
-  
-  // Используем секунды для плавного перехода
-  long currentSeconds = (long)now.hour() * 3600 + now.minute() * 60 + now.second();
-  long alarmSeconds = (long)alarmHour * 3600 + alarmMinute * 60;
-  long sunriseStartSeconds = alarmSeconds - (long)sunriseDuration * 60;
-  long sunriseDurationSeconds = (long)sunriseDuration * 60;
-  
-  // Проверка с учётом перехода через полночь
-  bool inSunrise = false;
-  long elapsedSeconds = 0;
-  
-  if (sunriseStartSeconds < 0) {
-    // Рассвет начинается до полуночи
-    sunriseStartSeconds += 86400;
-    if (currentSeconds >= sunriseStartSeconds || currentSeconds < alarmSeconds) {
-      inSunrise = true;
-      if (currentSeconds >= sunriseStartSeconds) {
-        elapsedSeconds = currentSeconds - sunriseStartSeconds;
-      } else {
-        elapsedSeconds = (86400 - sunriseStartSeconds) + currentSeconds;
-      }
-    }
-  } else {
-    // Обычный случай - рассвет в тот же день
-    if (currentSeconds >= sunriseStartSeconds && currentSeconds < alarmSeconds) {
-      inSunrise = true;
-      elapsedSeconds = currentSeconds - sunriseStartSeconds;
-    }
-  }
-  
-  int currentMinutes = now.hour() * 60 + now.minute();
-  int alarmMinutes = alarmHour * 60 + alarmMinute;
-  
-  // Рассвет
-  if (inSunrise) {
-    // Проверяем не был ли будильник уже выключен пользователем
-    if (alarmDismissedAt >= 0) {
-      // Debug: будильник заблокирован
-      static unsigned long lastDebugPrint = 0;
-      if (millis() - lastDebugPrint > 5000) { // Раз в 5 секунд
-        Serial.println("⏸ Будильник заблокирован (dismissed at " + String(alarmDismissedAt / 60) + ":" + String(alarmDismissedAt % 60) + ")");
-        lastDebugPrint = millis();
-      }
-      return; // Будильник уже выключен, не включаем снова
-    }
-    
-    // Не запускаем рассвет если свет уже включен вручную
-    if (!sunriseActive && currentBrightness > 0) {
-      return; // Пользователь уже проснулся
-    }
-    
-    if (!sunriseActive) {
-      Serial.println("🌅 Запуск рассвета!");
-      sunriseActive = true;
-      alarmTriggered = false;
-      
-      // Получаем начальный цвет градиента и сразу устанавливаем его
-      uint32_t colors[3];
-      getSunriseGradient(sunrisePreset, colors);
-      curR = (colors[0] >> 16) & 0xFF;
-      curG = (colors[0] >> 8) & 0xFF;
-      curB = colors[0] & 0xFF;
-      curBr = 0; // Яркость начинается с 0
-      tgtR = curR; tgtG = curG; tgtB = curB;
-      tgtBr = 1; // Начальная целевая яркость
-      
-      // Вычисляем время старта рассвета на основе уже прошедшего времени
-      sunriseDurationMillis = (unsigned long)sunriseDuration * 60 * 1000;
-      sunriseStartMillis = millis() - (unsigned long)elapsedSeconds * 1000;
-    }
-    
-    // Цвет обновляется в loop через millis
-  }
-  // Будильник сработал (после рассвета - держим максимальную яркость)
-  else if (currentMinutes >= alarmMinutes && currentMinutes < alarmMinutes + 5) {
-    // Проверяем не был ли будильник уже выключен пользователем
-    if (alarmDismissedAt >= 0) {
-      return; // Будильник уже выключен, не включаем снова
-    }
-    
-    if (!alarmTriggered) {
-      alarmTriggered = true;
-      alarmTriggeredTime = millis();
-      // Устанавливаем progress = 1.0
-      sunriseStartMillis = millis() - sunriseDurationMillis;
-    }
-    // Цвет обновляется в loop
-  }
-  // После будильника — автовыключение
-  else if (alarmTriggered) {
-    unsigned long elapsed = millis() - alarmTriggeredTime;
-    unsigned long timeout = 0;
-    
-    if (afterAlarm == "30") timeout = 30 * 60 * 1000UL;
-    else if (afterAlarm == "60") timeout = 60 * 60 * 1000UL;
-    
-    if (afterAlarm != "keep" && elapsed > timeout) {
-      turnOff();
-      sunriseActive = false;
-      alarmTriggered = false;
-    }
-  }
-  else {
-    if (sunriseActive) {
-      sunriseActive = false;
-    }
-    // Сбрасываем флаг выключения когда время вышло за диапазон будильника
-    if (alarmDismissedAt >= 0) {
-      Serial.println("✅ Сброс dismiss флага (время вышло за диапазон будильника)");
-    }
-    alarmDismissedAt = -1;
-  }
-}
-
-// ===== NTP SYNC =====
-
-void syncNTP() {
-  configTime(gmtOffset, 0, ntpServer, "time.google.com", "time.cloudflare.com");
-  
-  Serial.print("Синхронизация NTP");
-  
-  // Ждём получения времени (максимум 10 секунд)
-  time_t now = 0;
-  int attempts = 0;
-  while (now < 1000000000 && attempts < 20) {
-    delay(500);
-    Serial.print(".");
-    time(&now);
-    attempts++;
-  }
-  
-  if (now > 1000000000) {
-    // Обновляем RTC
-    struct tm* timeinfo = localtime(&now);
-    rtc.adjust(DateTime(
-      timeinfo->tm_year + 1900,
-      timeinfo->tm_mon + 1,
-      timeinfo->tm_mday,
-      timeinfo->tm_hour,
-      timeinfo->tm_min,
-      timeinfo->tm_sec
-    ));
-    
-    ntpSynced = true;
-    lastNtpSync = millis();
-    Serial.println("\nNTP синхронизировано!");
-    Serial.printf("Время: %02d:%02d:%02d\n", timeinfo->tm_hour, timeinfo->tm_min, timeinfo->tm_sec);
-  } else {
-    Serial.println("\nNTP ошибка, используем RTC");
-  }
+  server.send(200, "text/plain; charset=utf-8", out);
 }
 
 // ===== SETUP =====
 
 void setup() {
   Serial.begin(115200);
-  Serial.println("\n\nРассвет-будильник v2");
-  
+  Serial.println("\n");
+  logMsg("Рассвет-будильник v3, причина перезагрузки: %s", ESP.getResetReason().c_str());
+
   EEPROM.begin(EEPROM_SIZE);
   loadFromEEPROM();
-  
+
+  buildGamma();
   strip.begin();
-  strip.setBrightness(200); // Ограничение ~80% для безопасности БП
-  showStrip();
-  
-  Wire.begin(D2, D1);
-  if (!rtc.begin()) {
-    Serial.println("RTC не найден!");
-  }
-  if (rtc.lostPower()) {
-    rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
-  }
-  
-  WiFi.begin(ssid, password);
-  Serial.print("Подключение к WiFi");
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.println("\nПодключено!");
-  Serial.print("IP: ");
-  Serial.println(WiFi.localIP());
-  
-  // Синхронизация времени через NTP
-  syncNTP();
-  
-  if (MDNS.begin("sunrise")) {
-    Serial.println("mDNS: http://sunrise.local");
-  }
-  
+  // При загрузке ESP8266 выводит на GPIO2 (D4) служебные байты по UART, и первый светодиод
+  // принимает их как цвет. Даём ленте паузу, чтобы она сбросила приём, и очищаем дважды
+  delay(5);
+  strip.clear();
+  strip.show();
+  delay(5);
+  renderOff();
+
+  setupTime();
+  setupWiFi();
+
   server.on("/", handleRoot);
   server.on("/manifest.json", handleManifest);
   server.on("/status", handleStatus);
@@ -2810,188 +2906,98 @@ void setup() {
   server.on("/demo", handleDemo);
   server.on("/snooze", handleSnooze);
   server.on("/reset", handleReset);
-  
+  server.on("/log", handleLog);
+  server.onNotFound([]() { server.send(404, "text/plain", "Not found"); });
   server.begin();
-  Serial.println("Сервер запущен!");
+
+  logMsg("Будильник %02d:%02d, %s, маска дней %u, рассвет %d мин, источник времени: %s",
+    alarmHour, alarmMinute, alarmEnabled ? "включён" : "выключен",
+    (unsigned)weekdays, sunriseDuration, timeSource());
+  logMsg("Сервер запущен");
 }
 
 // ===== LOOP =====
 
+// Шаг к целевому значению с ограничением скорости
+inline void approach(float& cur, float tgt, float step) {
+  if (cur < tgt) { cur += step; if (cur > tgt) cur = tgt; }
+  else if (cur > tgt) { cur -= step; if (cur < tgt) cur = tgt; }
+}
+
 void loop() {
   server.handleClient();
-  MDNS.update();
-  
-  // Проверка окончания демо
-  if (demoActive) {
-    if (demoSpeed <= 0) demoSpeed = 30; // Защита от деления на 0
-    unsigned long elapsed = millis() - demoStartTime;
-    float progress = (float)elapsed / (demoSpeed * 1000);
-    if (progress >= 1.0) {
-      demoActive = false;
-      currentBrightness = 0;
-      targetBrightness = 0;
-      brightness = 0;
-      // Сбросить переменные рассвета
-      curR = 0; curG = 0; curB = 0; curBr = 0;
-      tgtR = 0; tgtG = 0; tgtB = 0; tgtBr = 0;
-      // Сбросить цвет на текущий пресет
-      currentColor = targetColor;
-      turnOff();
-    }
+  if (mdnsStarted) MDNS.update();
+  if (otaStarted) ArduinoOTA.handle();
+  handleWiFi();
+  handleEepromCommit();
+
+  if (rtcWritePending) {
+    rtcWritePending = false;
+    if (rtcFound) rtc.adjust(DateTime((uint32_t)(time(nullptr) + tzOffset)));
+    logMsg("NTP: время получено%s", rtcFound ? ", записано в DS3231" : "");
   }
-  
-  // Проверка будильника - каждую секунду
+
+  // Проверка будильника - раз в секунду (во время демо не трогаем)
   static unsigned long lastCheck = 0;
   if (millis() - lastCheck > 1000) {
     lastCheck = millis();
-    if (!demoActive) {
-      checkAlarm();
-    }
+    if (!demoActive) checkAlarm();
   }
-  
-  // Обновление рассвета/демо - каждые 20мс (~50 fps)
-  static unsigned long lastSunriseUpdate = 0;
-  if ((sunriseActive || alarmTriggered || demoActive) && millis() - lastSunriseUpdate > 20) {
-    lastSunriseUpdate = millis();
-    
-    // Вычисляем progress
-    float progress;
+
+  // Конец демо
+  if (demoActive && millis() - demoStartTime >= (unsigned long)demoSpeed * 1000UL) {
+    demoActive = false;
+    curR = curG = curB = curBr = 0;
+    renderOff();
+  }
+
+  // Рассвет / удержание / демо - 25 fps. С 16-битной яркостью этого достаточно, а прерывания
+  // выключаются вдвое реже, чем при 50 fps
+  static unsigned long lastSunriseFrame = 0;
+  if ((phase != PHASE_IDLE || demoActive) && millis() - lastSunriseFrame > 40) {
+    lastSunriseFrame = millis();
+
     if (demoActive) {
-      if (demoSpeed <= 0) demoSpeed = 30;
-      progress = (float)(millis() - demoStartTime) / (demoSpeed * 1000);
-    } else if (sunriseDurationMillis > 0) {
-      progress = (float)(millis() - sunriseStartMillis) / sunriseDurationMillis;
+      float progress = (float)(millis() - demoStartTime) / (demoSpeed * 1000.0f);
+      if (progress > 1.0f) progress = 1.0f;
+      setSunriseTarget(progress, demoPreset, demoColors);
     } else {
-      progress = 1.0;
+      setSunriseTarget(sunriseProgress, sunrisePreset, sunriseColors);
     }
-    if (progress < 0) progress = 0;
-    if (progress > 1.0) progress = 1.0;
-    
-    // Устанавливаем target из progress
-    setSunriseColor(progress);
-    
-    // Линейный step для плавного перехода
-    const float colorStep = 0.8;  // Шаг цвета
-    const float brStep = 0.4;     // Шаг яркости
-    
-    // Линейное изменение R
-    if (curR < tgtR) { curR += colorStep; if (curR > tgtR) curR = tgtR; }
-    else if (curR > tgtR) { curR -= colorStep; if (curR < tgtR) curR = tgtR; }
-    
-    // Линейное изменение G
-    if (curG < tgtG) { curG += colorStep; if (curG > tgtG) curG = tgtG; }
-    else if (curG > tgtG) { curG -= colorStep; if (curG < tgtG) curG = tgtG; }
-    
-    // Линейное изменение B
-    if (curB < tgtB) { curB += colorStep; if (curB > tgtB) curB = tgtB; }
-    else if (curB > tgtB) { curB -= colorStep; if (curB < tgtB) curB = tgtB; }
-    
-    // Линейное изменение яркости
-    if (curBr < tgtBr) { curBr += brStep; if (curBr > tgtBr) curBr = tgtBr; }
-    else if (curBr > tgtBr) { curBr -= brStep; if (curBr < tgtBr) curBr = tgtBr; }
-    
-    applySunriseToStrip();
-  }
-  
-  // Периодическая синхронизация NTP (каждый час)
-  if (millis() - lastNtpSync > ntpSyncInterval) {
-    syncNTP();
+
+    // Цвет догоняет цель быстрее, яркость - медленнее (0.2%/кадр = от 0 до 100 за 20 с)
+    approach(curR, tgtR, 0.8f);
+    approach(curG, tgtG, 0.8f);
+    approach(curB, tgtB, 0.8f);
+    approach(curBr, tgtBr, 0.2f);
+
+    renderColor((uint8_t)curR, (uint8_t)curG, (uint8_t)curB, curBr / 100.0f);
   }
 
-  // Переподключение WiFi
-  static unsigned long lastWifiCheck = 0;
-  static int wifiRetries = 0;
-  if (millis() - lastWifiCheck > 5000) {
-    lastWifiCheck = millis();
-    if (WiFi.status() != WL_CONNECTED) {
-      wifiRetries++;
-      Serial.println("WiFi потерян, попытка " + String(wifiRetries));
+  // Ручной свет - 50 fps
+  static unsigned long lastManualFrame = 0;
+  if (phase == PHASE_IDLE && !demoActive && millis() - lastManualFrame > 20) {
+    lastManualFrame = millis();
 
-      if (wifiRetries <= 3) {
-        WiFi.reconnect();
-        // Ждем подключения до 10 сек
-        unsigned long start = millis();
-        while (WiFi.status() != WL_CONNECTED && millis() - start < 10000) {
-          delay(100);
-        }
-        if (WiFi.status() == WL_CONNECTED) {
-          Serial.println("WiFi переподключен");
-          wifiRetries = 0;
-        }
-      } else if (wifiRetries <= 6) {
-        // Полный перезапуск WiFi
-        Serial.println("Полный перезапуск WiFi...");
-        WiFi.disconnect();
-        delay(1000);
-        WiFi.begin(ssid, password);
-        unsigned long start = millis();
-        while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {
-          delay(100);
-        }
-        if (WiFi.status() == WL_CONNECTED) {
-          Serial.println("WiFi перезапущен");
-          wifiRetries = 0;
-        }
-      } else {
-        // Полная перезагрузка ESP
-        Serial.println("Перезагрузка ESP...");
-        delay(1000);
-        ESP.restart();
-      }
-    } else {
-      wifiRetries = 0;
-    }
-  }
-  
-  // Автовыключение по таймеру
-  if (autoOffMinutes > 0 && currentBrightness > 0 && !sunriseActive && !alarmTriggered && !demoActive) {
-    unsigned long autoOffMs = (unsigned long)autoOffMinutes * 60 * 1000;
-    if (millis() - lastInteractionTime > autoOffMs) {
-      targetBrightness = 0;
+    // Автовыключение по таймеру бездействия
+    if (autoOffMinutes > 0 && brightness > 0 && millis() - lastInteractionTime > (unsigned long)autoOffMinutes * 60000UL) {
       brightness = 0;
+      logTime("Свет выключен по таймеру автовыключения");
     }
-  }
-  
-  // Плавное изменение яркости и цвета
-  static unsigned long lastBrightnessUpdate = 0;
-  if (millis() - lastBrightnessUpdate > 20) { // ~50 fps
-    lastBrightnessUpdate = millis();
-    
-    if (!demoActive && !sunriseActive && !alarmTriggered) {
-      bool needUpdate = false;
-      
-      // Плавное изменение яркости
-      if (currentBrightness != targetBrightness) {
-        int step = smoothness > 0 ? smoothness : 1;
-        
-        if (currentBrightness < targetBrightness) {
-          currentBrightness += step;
-          if (currentBrightness > targetBrightness) currentBrightness = targetBrightness;
-        } else {
-          currentBrightness -= step;
-          if (currentBrightness < targetBrightness) currentBrightness = targetBrightness;
-        }
-        needUpdate = true;
+
+    approach(currentBrightness, brightness, smoothness > 0 ? smoothness : 1);
+
+    if (currentBrightness <= 0) {
+      renderOff();
+    } else if (lightPreset == "rainbow") {
+      static unsigned long lastRainbow = 0;
+      if (millis() - lastRainbow > 50) {
+        lastRainbow = millis();
+        renderRainbow(currentBrightness / 100.0f);
       }
-      
-      // Плавное изменение цвета отключено - мгновенное переключение
-      if (currentColor != targetColor) {
-        currentColor = targetColor;
-        needUpdate = true;
-      }
-      
-      if (needUpdate && lightPreset != "rainbow") {
-        applyLightPreset();
-      }
-    }
-  }
-  
-  // Обновление радуги
-  static unsigned long lastRainbow = 0;
-  if (millis() - lastRainbow > 50) {
-    lastRainbow = millis();
-    if (!demoActive && !sunriseActive && !alarmTriggered && lightPreset == "rainbow" && currentBrightness > 0) {
-      rainbowCycle();
+    } else {
+      uint32_t c = lightPresetColor();
+      renderColor((c >> 16) & 0xFF, (c >> 8) & 0xFF, c & 0xFF, currentBrightness / 100.0f);
     }
   }
 }

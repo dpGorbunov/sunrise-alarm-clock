@@ -72,8 +72,15 @@ graph LR
    ```cpp
    const char* ssid = "YOUR_WIFI";
    const char* password = "YOUR_PASSWORD";
+   const char* otaPassword = "YOUR_OTA_PASSWORD"; // пароль прошивки по WiFi
    ```
-4. Загрузить на ESP8266
+4. Первый раз загрузить по USB. Дальше можно по WiFi (ArduinoOTA):
+   ```bash
+   arduino-cli upload -p sunrise.local --fqbn esp8266:esp8266:nodemcuv2 --upload-field password=YOUR_OTA_PASSWORD .
+   ```
+
+Время берётся по NTP, DS3231 - резерв: без WiFi будильник работает от часов. Без батарейки
+в DS3231 после пропадания питания время восстановится только когда появится WiFi.
 
 ## API
 
@@ -96,3 +103,4 @@ curl "http://sunrise.local/status"
 | `/demo` | Демо рассвета |
 | `/snooze` | Отложить (+5 мин) |
 | `/reset` | Сброс настроек |
+| `/log` | Журнал последних событий (текст) |
